@@ -28,11 +28,17 @@ if(DEEPGEMM_SRC_DIR)
   message(STATUS "DeepGEMM using local DEEPGEMM_SRC_DIR: ${deepgemm_SOURCE_DIR}")
 else()
   # Keep in sync with tools/install_deepgemm.sh
-  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
-  # Pinned to the tip of the fork's dev branch: upstream 2.8.0 plus the SM120
-  # port, the SM90 paged-MQA kv_block=32/next_n=4 port, configurable SwiGLU
-  # alpha/beta, and SiTU for FP8/FP4 Mega MoE.
-  set(_DEEPGEMM_UPSTREAM_TAG "a6bbb8000161c0dc3a85a0300a905f76898a7913")
+  if(WIN32)
+    # Upstream DeepGEMM has no MSVC/CUDA-on-Windows build; this fork does.
+    set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/SystemPanic/DeepGEMM-windows.git")
+    set(_DEEPGEMM_UPSTREAM_TAG "6714f340520959297d9248f181c027f6cfea5a44")
+  else()
+    set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
+    # Pinned to the tip of the fork's dev branch: upstream 2.8.0 plus the SM120
+    # port, the SM90 paged-MQA kv_block=32/next_n=4 port, configurable SwiGLU
+    # alpha/beta, and SiTU for FP8/FP4 Mega MoE.
+    set(_DEEPGEMM_UPSTREAM_TAG "a6bbb8000161c0dc3a85a0300a905f76898a7913")
+  endif()
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
   if(NOT _deepgemm_fc_root)
