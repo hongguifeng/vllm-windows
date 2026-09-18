@@ -5,6 +5,7 @@
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
+import platform
 from typing import ClassVar
 
 import numpy as np
@@ -2475,24 +2476,38 @@ class FlashInferImpl(AttentionImpl):
                     )
                     q_len_per_req: int | None = attn_metadata.decode.q_len_per_req
 
-                    flashinfer_xqa_batch_decode_with_kv_cache(
-                        query=decode_query,
-                        kv_cache=kv_cache_tuple,
-                        workspace_buffer=workspace_buffer,
-                        block_tables=block_tables_decode,
-                        seq_lens=seq_lens_decode,
-                        max_seq_len=attn_metadata.decode.max_seq_len,
-                        bmm1_scale=bmm1_scale,
-                        bmm2_scale=self.bmm2_scale,
-                        window_left=self.window_left,
-                        out=output_padded[:decode_query_tokens],
-                        sinks=self.sinks,
-                        kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
-                        q_len_per_req=q_len_per_req,
-                        mask=attn_metadata.decode.mask,
-                        q_cu_seq_lens=attn_metadata.decode.q_cu_seq_lens,
+                    # flashinfer-windows <= 0.6.11 has no q_cu_seq_lens support in
+                    # xqa_batch_decode, so ragged varlen decode falls through to the
+                    # trtllm-gen path below.
+                    _xqa_q_cu = attn_metadata.decode.q_cu_seq_lens
+                    on_windows = platform.system() == "Windows"
+                    if not on_windows or _xqa_q_cu is None:
+                        xqa_kwargs = dict(
+                            query=decode_query,
+                            kv_cache=kv_cache_tuple,
+                            workspace_buffer=workspace_buffer,
+                            block_tables=block_tables_decode,
+                            seq_lens=seq_lens_decode,
+                            max_seq_len=attn_metadata.decode.max_seq_len,
+                            bmm1_scale=bmm1_scale,
+                            bmm2_scale=self.bmm2_scale,
+                            window_left=self.window_left,
+                            out=output_padded[:decode_query_tokens],
+                            sinks=self.sinks,
+                            kv_layout=get_flashinfer_layout_string(
+                                self.kv_cache_layout
+                            ),
+                            q_len_per_req=q_len_per_req,
+                            mask=attn_metadata.decode.mask,
+                        )
+                        if not on_windows:
+                            xqa_kwargs["q_cu_seq_lens"] = _xqa_q_cu
+                        flashinfer_xqa_batch_decode_with_kv_cache(**xqa_kwargs)
+                        return output_padded
+                    logger.warning_once(
+                        "flashinfer-windows xqa_batch_decode_with_kv_cache has no "
+                        "q_cu_seq_lens support; using trtllm-gen decode instead."
                     )
-                    return output_padded
 
                 assert decode_with_trtllm_gen
                 if output.dtype == FP4_DTYPE:
@@ -2539,7 +2554,7 @@ class FlashInferImpl(AttentionImpl):
                         device=decode_query.device,
                     )
 
-                trtllm_batch_decode_with_kv_cache(
+                trtllm_kwargs = dict(
                     query=decode_query,
                     kv_cache=(
                         nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
@@ -2562,9 +2577,20 @@ class FlashInferImpl(AttentionImpl):
                     kv_cache_sf=(
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     ),
-                    lse=lse,
-                    return_lse=self.need_to_return_lse_for_decode,
                 )
+                if platform.system() == "Windows":
+                    # flashinfer-windows <= 0.6.11 does not return LSE from trtllm
+                    # decode; hand the DCP combine path a zero LSE so it still runs.
+                    if lse is None:
+                        lse = torch.zeros(
+                            (out.size(0), out.size(1)),
+                            dtype=torch.float32,
+                            device=out.device,
+                        )
+                else:
+                    trtllm_kwargs["lse"] = lse
+                    trtllm_kwargs["return_lse"] = self.need_to_return_lse_for_decode
+                trtllm_batch_decode_with_kv_cache(**trtllm_kwargs)
 
                 if use_dcp:
                     assert isinstance(out, torch.Tensor)
