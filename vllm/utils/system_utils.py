@@ -272,11 +272,11 @@ def kill_process_tree(pid: int):
     # Send SIGKILL to all children first
     for child in children:
         with contextlib.suppress(ProcessLookupError):
-            os.kill(child.pid, signal.SIGKILL)
+            os.kill(child.pid, signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
 
     # Finally kill the parent
     with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
+        os.kill(pid, signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
 
 
 # Resource utilities

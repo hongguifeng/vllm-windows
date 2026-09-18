@@ -884,6 +884,22 @@ class WorkerProc:
         # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set
         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
 
+        # VLLM_WINDOWS_MULTIPROCESS_CACHE_ISOLATION SystemPanic/vllm-windows/issues/85
+        # Triton cache artifacts are briefly locked while being published on
+        # Windows. A shared cache can therefore fail when multiple ranks compile
+        # and immediately read the same .cubin or IR file concurrently.
+        if os.name == "nt":
+            worker_rank = kwargs.get("rank", kwargs.get("local_rank", 0))
+            cache_suffix = f"rank-{worker_rank}"
+            os.environ["VLLM_WINDOWS_CACHE_RANK"] = cache_suffix
+
+            for cache_env in ("TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"):
+                base_cache = os.environ.get(cache_env)
+                if base_cache:
+                    rank_cache = os.path.join(base_cache, cache_suffix)
+                    os.makedirs(rank_cache, exist_ok=True)
+                    os.environ[cache_env] = rank_cache
+
         worker = None
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)

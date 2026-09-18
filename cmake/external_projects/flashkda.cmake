@@ -68,6 +68,11 @@ if(FLASH_KDA_ARCHS)
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     target_compile_definitions(_flashkda_C PRIVATE USE_CUDA)
   endif()
+  
+  if(WIN32)
+    find_package(Python3 COMPONENTS Development REQUIRED)
+    target_link_libraries(_flashkda_C PRIVATE Python3::Python)
+  endif()
 
   target_compile_options(_flashkda_C PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-UPy_LIMITED_API --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -O3>
