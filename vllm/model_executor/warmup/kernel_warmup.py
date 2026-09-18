@@ -233,7 +233,13 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     timings are averaged over the world CPU group so all ranks select the
     same tactic.
     """
-    from flashinfer.autotuner import AutoTuner, set_autotune_process_group
+    # TODO: Remove win_fix_enable_set_autotune_process_group when https://github.com/flashinfer-ai/flashinfer/issues/3786 is resolved
+    win_fix_enable_set_autotune_process_group = True
+    try:
+        from flashinfer.autotuner import AutoTuner, set_autotune_process_group
+    except:
+        from flashinfer.autotuner import AutoTuner
+        win_fix_enable_set_autotune_process_group = False
 
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
@@ -281,8 +287,9 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         world.barrier()
         tuner.load_configs(str(cache_path))
 
-    group = world.cpu_group if world.world_size > 1 else None
-    set_autotune_process_group(group)
+    if win_fix_enable_set_autotune_process_group:
+        group = world.cpu_group if world.world_size > 1 else None
+        set_autotune_process_group(group)
     try:
         with (
             torch.inference_mode(),
@@ -290,7 +297,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         ):
             runner._dummy_run(**dummy_run_kwargs)
     finally:
-        set_autotune_process_group(None)
+        if win_fix_enable_set_autotune_process_group:
+            set_autotune_process_group(None)
 
     if world.world_size > 1:
         world.barrier()

@@ -7,8 +7,13 @@
 #include <fcntl.h>
 #ifdef _WIN32
 #include <io.h>
+#include <stdio.h>
 #define access _access
 #define F_OK 0
+#ifndef ssize_t
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#endif
 #else
 #include <unistd.h>
 #endif

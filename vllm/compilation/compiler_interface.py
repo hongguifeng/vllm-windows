@@ -473,9 +473,20 @@ class InductorAdaptor(CompilerInterface):
         # in the cache_dir, then users only need to copy the cache_dir
         # to another machine to reuse the cache.
         inductor_cache = os.path.join(self.base_cache_dir, "inductor_cache")
+        triton_cache = os.path.join(self.base_cache_dir, "triton_cache")
+
+        # VLLM_WINDOWS_MULTIPROCESS_CACHE_ISOLATION SystemPanic/vllm-windows/issues/85
+        # Preserve deterministic per-rank caches on Windows. This prevents
+        # concurrent Triton readers from opening artifacts still locked by a
+        # different worker process.
+        if os.name == "nt":
+            cache_rank = os.environ.get("VLLM_WINDOWS_CACHE_RANK")
+            if cache_rank:
+                inductor_cache = os.path.join(inductor_cache, cache_rank)
+                triton_cache = os.path.join(triton_cache, cache_rank)
+
         os.makedirs(inductor_cache, exist_ok=True)
         os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache
-        triton_cache = os.path.join(self.base_cache_dir, "triton_cache")
         os.makedirs(triton_cache, exist_ok=True)
         os.environ["TRITON_CACHE_DIR"] = triton_cache
 

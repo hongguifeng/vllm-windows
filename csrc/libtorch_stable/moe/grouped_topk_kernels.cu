@@ -994,8 +994,8 @@ __global__ void __launch_bounds__(BlockDim)
   }
 #endif
 
-  __shared__ float __attribute((aligned(128))) biased_scores[MaxNumExperts];
-  __shared__ float __attribute((aligned(128))) unbiased_scores[MaxNumExperts];
+  __shared__ __align__(128) float biased_scores[MaxNumExperts];
+  __shared__ __align__(128) float unbiased_scores[MaxNumExperts];
 
   int32_t const token = static_cast<int32_t>(blockIdx.x);
   int32_t const lane = static_cast<int32_t>(threadIdx.x) % WARP_SIZE;
@@ -1015,10 +1015,8 @@ __global__ void __launch_bounds__(BlockDim)
   auto warp = cg::tiled_partition<WARP_SIZE>(cg::this_thread_block());
 
   if constexpr (UseHierarchicalLaneTopK) {
-    __shared__ float
-        __attribute((aligned(128))) intermediate_scores[NumIntermediate];
-    __shared__ int32_t
-        __attribute((aligned(128))) intermediate_indices[NumIntermediate];
+    __shared__ __align__(128) float intermediate_scores[NumIntermediate];
+    __shared__ __align__(128) int32_t intermediate_indices[NumIntermediate];
 
     if (warp_id < NumWorkerWarps) {
       float local_scores[WorkerValuesPerLane];
