@@ -5,6 +5,7 @@
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
+import platform
 from typing import ClassVar
 
 import numpy as np
@@ -2400,24 +2401,56 @@ class FlashInferImpl(AttentionImpl):
                     )
                     q_len_per_req: int | None = attn_metadata.decode.q_len_per_req
 
-                    flashinfer_xqa_batch_decode_with_kv_cache(
-                        query=decode_query,
-                        kv_cache=kv_cache_tuple,
-                        workspace_buffer=workspace_buffer,
-                        block_tables=block_tables_decode,
-                        seq_lens=seq_lens_decode,
-                        max_seq_len=attn_metadata.decode.max_seq_len,
-                        bmm1_scale=bmm1_scale,
-                        bmm2_scale=self.bmm2_scale,
-                        window_left=self.window_left,
-                        out=output[:num_decode_tokens],
-                        sinks=self.sinks,
-                        kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
-                        q_len_per_req=q_len_per_req,
-                        mask=attn_metadata.decode.mask,
-                        q_cu_seq_lens=attn_metadata.decode.q_cu_seq_lens,
-                    )
-                    return output_padded
+                    # TODO: Fix for Windows FlashInfer <= 0.6.11 until
+                    # CuTe DSL release: xqa_batch_decode does NOT
+                    # support q_cu_seq_lens (ragged varlen decode).
+                    # Only take the dedicated XQA path when there is no
+                    # ragged q_cu_seq_lens; otherwise fall through to
+                    # the trtllm-gen path which does support it.
+                    _xqa_q_cu = attn_metadata.decode.q_cu_seq_lens
+                    if platform.system() == "Windows":
+                        if _xqa_q_cu is None:
+                            flashinfer_xqa_batch_decode_with_kv_cache(
+                                query=decode_query,
+                                kv_cache=kv_cache_tuple,
+                                workspace_buffer=workspace_buffer,
+                                block_tables=block_tables_decode,
+                                seq_lens=seq_lens_decode,
+                                max_seq_len=attn_metadata.decode.max_seq_len,
+                                bmm1_scale=bmm1_scale,
+                                bmm2_scale=self.bmm2_scale,
+                                window_left=self.window_left,
+                                out=output[:num_decode_tokens],
+                                sinks=self.sinks,
+                                kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                                q_len_per_req=q_len_per_req,
+                                mask=attn_metadata.decode.mask,
+                            )
+                            return output_padded
+                        else:
+                            logger.warning_once(
+                                "FlashInfer Windows xqa_batch_decode_with_kv_cache does not "
+                                "support q_cu_seq_lens yet."
+                            )
+                    else:
+                        flashinfer_xqa_batch_decode_with_kv_cache(
+                            query=decode_query,
+                            kv_cache=kv_cache_tuple,
+                            workspace_buffer=workspace_buffer,
+                            block_tables=block_tables_decode,
+                            seq_lens=seq_lens_decode,
+                            max_seq_len=attn_metadata.decode.max_seq_len,
+                            bmm1_scale=bmm1_scale,
+                            bmm2_scale=self.bmm2_scale,
+                            window_left=self.window_left,
+                            out=output[:num_decode_tokens],
+                            sinks=self.sinks,
+                            kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                            q_len_per_req=q_len_per_req,
+                            mask=attn_metadata.decode.mask,
+                            q_cu_seq_lens=attn_metadata.decode.q_cu_seq_lens,
+                        )
+                        return output_padded
 
                 if output.dtype == FP4_DTYPE:
                     assert self.o_sf_scale is not None
@@ -2476,32 +2509,69 @@ class FlashInferImpl(AttentionImpl):
                         device=decode_query.device,
                     )
 
-                trtllm_batch_decode_with_kv_cache(
-                    query=decode_query,
-                    kv_cache=(
-                        nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
-                    ),
-                    workspace_buffer=workspace_buffer,
-                    block_tables=block_tables_decode,
-                    seq_lens=seq_lens_decode,
-                    max_seq_len=attn_metadata.decode.max_seq_len,
-                    bmm1_scale=bmm1_scale,
-                    bmm2_scale=self.bmm2_scale,
-                    window_left=self.window_left,
-                    sinks=self.sinks,
-                    o_sf_scale=self.o_sf_scale,
-                    out=out,
-                    kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
-                    backend=attn_metadata.decode.kernel.value,
-                    q_len_per_req=q_len_per_req,
-                    max_q_len=max_q_len,
-                    cum_seq_lens_q=q_cu_seq_lens,
-                    kv_cache_sf=(
-                        nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
-                    ),
-                    lse=lse,
-                    return_lse=self.need_to_return_lse_for_decode,
-                )
+                # TODO: FlashInfer <= 0.6.11: trtllm_batch_decode does NOT
+                # support lse / return_lse parameters.
+                if platform.system() == "Windows":
+                    trtllm_batch_decode_with_kv_cache(
+                        query=decode_query,
+                        kv_cache=(
+                            nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
+                        ),
+                        workspace_buffer=workspace_buffer,
+                        block_tables=block_tables_decode,
+                        seq_lens=seq_lens_decode,
+                        max_seq_len=attn_metadata.decode.max_seq_len,
+                        bmm1_scale=bmm1_scale,
+                        bmm2_scale=self.bmm2_scale,
+                        window_left=self.window_left,
+                        sinks=self.sinks,
+                        o_sf_scale=self.o_sf_scale,
+                        out=out,
+                        kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                        backend=attn_metadata.decode.kernel.value,
+                        q_len_per_req=q_len_per_req,
+                        max_q_len=max_q_len,
+                        cum_seq_lens_q=q_cu_seq_lens,
+                        kv_cache_sf=(
+                            nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                        ),
+                    )
+                    # FlashInfer 0.6.11 does not return LSE from
+                    # trtllm decode; fall back to a dummy zero LSE so
+                    # the DCP combine path still runs.
+                    if lse is None:
+                        lse = torch.zeros(
+                            (out.size(0), out.size(1)),
+                            dtype=torch.float32,
+                            device=out.device,
+                        )
+                else:
+                    trtllm_batch_decode_with_kv_cache(
+                        query=decode_query,
+                        kv_cache=(
+                            nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
+                        ),
+                        workspace_buffer=workspace_buffer,
+                        block_tables=block_tables_decode,
+                        seq_lens=seq_lens_decode,
+                        max_seq_len=attn_metadata.decode.max_seq_len,
+                        bmm1_scale=bmm1_scale,
+                        bmm2_scale=self.bmm2_scale,
+                        window_left=self.window_left,
+                        sinks=self.sinks,
+                        o_sf_scale=self.o_sf_scale,
+                        out=out,
+                        kv_layout=get_flashinfer_layout_string(self.kv_cache_layout),
+                        backend=attn_metadata.decode.kernel.value,
+                        q_len_per_req=q_len_per_req,
+                        max_q_len=max_q_len,
+                        cum_seq_lens_q=q_cu_seq_lens,
+                        kv_cache_sf=(
+                            nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
+                        ),
+                        lse=lse,
+                        return_lse=self.need_to_return_lse_for_decode,
+                    )
 
                 if use_dcp:
                     assert isinstance(out, torch.Tensor)

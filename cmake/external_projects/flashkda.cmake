@@ -70,8 +70,9 @@ if(FLASH_KDA_ARCHS)
   endif()
   
   if(WIN32)
-    find_package(Python3 COMPONENTS Development REQUIRED)
+    find_package(Python3 COMPONENTS Development Interpreter REQUIRED)
     target_link_libraries(_flashkda_C PRIVATE Python3::Python)
+    execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/fix_cutlass_msvc.py ${flashkda_SOURCE_DIR}/cutlass)
   endif()
 
   target_compile_options(_flashkda_C PRIVATE
