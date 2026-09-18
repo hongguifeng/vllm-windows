@@ -55,12 +55,11 @@ class ServerProcess:
 
     def stop(self):
         server_process = self._server_process
-
         if server_process.poll() is None:
             # In case only some processes have been terminated
             with contextlib.suppress(ProcessLookupError):
                 # We need to kill both API Server and Engine processes
-                os.killpg(os.getpgid(server_process.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(server_process.pid), signal.SIGTERM if os.name == "nt" else signal.SIGKILL)
 
     def run_subcommand(self, cmd: list[str]):
         return subprocess.run(
