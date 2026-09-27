@@ -197,7 +197,6 @@ async def run_server_worker(
 
 
 def main():
-    import uvloop
     import platform
     if platform.system() == "Windows":
         import winloop as uvloop_impl

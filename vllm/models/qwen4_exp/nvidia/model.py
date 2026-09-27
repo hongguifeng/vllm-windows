@@ -611,6 +611,9 @@ class Qwen4ExpModel(nn.Module):
             "token_lookup",
             "hyper_connection_mixer.block_inject_weight",
         )
+        if not self.config.ple_layer_ids:
+            # A PLE-free deployment still ships PLE columns in the checkpoint.
+            skip_substrs = skip_substrs + (".ple.",)
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={substr: None for substr in skip_substrs}
         )
