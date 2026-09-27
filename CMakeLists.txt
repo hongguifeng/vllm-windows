@@ -18,9 +18,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 if (WIN32)
-  # cl.exe misparses cute::Ints<...> in C++20 mode (C3545 in cute/stride.hpp,
-  # then C2062/C2976 cascading through cute::Layout). CUDA objects build as C++17.
-  set(CMAKE_CUDA_STANDARD 17)
+  # cl.exe misparses cute::Ints<...> under /std:c++20 (C3545 in cute/stride.hpp,
+  # then C2062/C2976 cascading through cute::Layout).  The CUDA front-end still
+  # needs C++20, so only the host compiler is pinned back to C++17 and only for
+  # the translation units that pull in cute.
+  file(GLOB_RECURSE VLLM_CUTE_SRCS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/w8a8/cutlass/*.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/w8a8/cutlass/*.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/fp4/*.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/quantization/cutlass_w4a8/*.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/attention/mla/*.cu")
+  set_property(SOURCE ${VLLM_CUTE_SRCS} APPEND PROPERTY
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/std:c++17>")
 endif()
 set(CMAKE_HIP_STANDARD 20)
 set(CMAKE_HIP_STANDARD_REQUIRED ON)
