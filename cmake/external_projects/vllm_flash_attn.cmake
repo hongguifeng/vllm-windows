@@ -83,6 +83,8 @@ if (WIN32)
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/D_USE_MATH_DEFINES>
         $<$<COMPILE_LANGUAGE:CXX>:/D_USE_MATH_DEFINES>
+        # FA kernels include cute, and cl.exe misparses cute::Ints under /std:c++20.
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/std:c++17>
       )
     endif()
   endforeach()
