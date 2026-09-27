@@ -47,6 +47,60 @@
 #include <torch/csrc/stable/device.h>
 
 #include <cmath>
+
+#ifdef _MSC_VER
+// nvcc's front end loses the enclosing scope in this unroll-heavy kernel once
+// cl.exe drives it, and DeepSeek V4 is not served on Windows. Define the four
+// entry points ops.h declares so torch_bindings still links, but make any call
+// fail loudly rather than quietly computing nothing.
+#include <optional>
+
+#define VLLM_DSv4_V4_NOT_BUILT() \
+  STD_TORCH_CHECK(false, "the fused DeepSeek V4 qnorm/rope/kv kernel is not "\
+                         "built with MSVC (nvcc + cl cannot parse it)")
+
+void fused_deepseek_v4_kv_rope_insert(
+    torch::stable::Tensor const& kv, torch::stable::Tensor& k_cache,
+    torch::stable::Tensor const& slot_mapping,
+    torch::stable::Tensor const& position_ids,
+    torch::stable::Tensor const& cos_sin_cache, int64_t cache_block_size,
+    std::optional<torch::stable::Tensor> fp8_scale, bool kv_mxfp8) {
+  VLLM_DSv4_V4_NOT_BUILT();
+}
+
+torch::stable::Tensor fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    torch::stable::Tensor const& q_in, torch::stable::Tensor const& kv,
+    torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
+    torch::stable::Tensor const& position_ids,
+    torch::stable::Tensor const& cos_sin_cache, int64_t q_head_padded,
+    double eps, int64_t cache_block_size, bool apply_q_norm, bool kv_mxfp8,
+    bool apply_q_rope, bool is_q_interleaved) {
+  VLLM_DSv4_V4_NOT_BUILT();
+  return torch::stable::Tensor();
+}
+
+void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+    torch::stable::Tensor& q, torch::stable::Tensor const& kv,
+    torch::stable::Tensor& k_cache, torch::stable::Tensor const& slot_mapping,
+    torch::stable::Tensor const& position_ids,
+    torch::stable::Tensor const& cos_sin_cache, double eps,
+    int64_t cache_block_size, bool apply_q_norm) {
+  VLLM_DSv4_V4_NOT_BUILT();
+}
+
+void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
+    torch::stable::Tensor const& q, torch::stable::Tensor const& kv,
+    torch::stable::Tensor& q_fp8, torch::stable::Tensor& k_cache,
+    torch::stable::Tensor const& slot_mapping,
+    torch::stable::Tensor const& position_ids,
+    torch::stable::Tensor const& cos_sin_cache,
+    torch::stable::Tensor const& fp8_scale,
+    torch::stable::Tensor const& q_fp8_scale_inv, double eps,
+    int64_t cache_block_size, bool apply_q_norm) {
+  VLLM_DSv4_V4_NOT_BUILT();
+}
+
+#else
 #include "cuda_compat.h"
 #include "dispatch_utils.h"
 #include "type_convert.cuh"
@@ -1385,3 +1439,5 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
             stream);
       });
 }
+
+#endif  // _MSC_VER (stub) vs the real kernel
