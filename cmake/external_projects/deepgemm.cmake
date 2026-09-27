@@ -32,12 +32,16 @@ else()
     # Upstream DeepGEMM has no MSVC/CUDA-on-Windows build; this fork does.
     set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/SystemPanic/DeepGEMM-windows.git")
     set(_DEEPGEMM_UPSTREAM_TAG "6714f340520959297d9248f181c027f6cfea5a44")
+    # This fork does not carry third-party/deep_jit, so asking for it makes the
+    # populate step fail with "pathspec ... did not match any file(s)".
+    set(_DEEPGEMM_SUBMODULES "third-party/cutlass" "third-party/fmt")
   else()
     set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
     # Pinned to the tip of the fork's dev branch: upstream 2.8.0 plus the SM120
     # port, the SM90 paged-MQA kv_block=32/next_n=4 port, configurable SwiGLU
     # alpha/beta, and SiTU for FP8/FP4 Mega MoE.
     set(_DEEPGEMM_UPSTREAM_TAG "a6bbb8000161c0dc3a85a0300a905f76898a7913")
+    set(_DEEPGEMM_SUBMODULES "third-party/cutlass" "third-party/deep_jit")
   endif()
 
   set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
@@ -59,7 +63,7 @@ else()
       BINARY_DIR "${_deepgemm_bin}"
       GIT_REPOSITORY "${_DEEPGEMM_UPSTREAM_REPO}"
       GIT_TAG "${_DEEPGEMM_UPSTREAM_TAG}"
-      GIT_SUBMODULES "third-party/cutlass" "third-party/deep_jit"
+      GIT_SUBMODULES ${_DEEPGEMM_SUBMODULES}
       GIT_PROGRESS TRUE
     )
   endif()
