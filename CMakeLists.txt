@@ -17,6 +17,11 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+if (WIN32)
+  # cl.exe misparses cute::Ints<...> in C++20 mode (C3545 in cute/stride.hpp,
+  # then C2062/C2976 cascading through cute::Layout). CUDA objects build as C++17.
+  set(CMAKE_CUDA_STANDARD 17)
+endif()
 set(CMAKE_HIP_STANDARD 20)
 set(CMAKE_HIP_STANDARD_REQUIRED ON)
 

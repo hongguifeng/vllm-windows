@@ -63,6 +63,10 @@ install(CODE "set(CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}/vllm/\")" ALL_
 if (WIN32)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/Zc:preprocessor")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:preprocessor")
+  # MSVC hides M_LOG2E and friends unless _USE_MATH_DEFINES is set before
+  # <cmath> is included; flash_api.cpp needs M_LOG2E for the softcap scaling.
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/D_USE_MATH_DEFINES")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /D_USE_MATH_DEFINES")
 endif()
 
 FetchContent_MakeAvailable(vllm-flash-attn)
@@ -77,6 +81,8 @@ if (WIN32)
       target_compile_options(${_fa_tgt} PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/D_USE_MATH_DEFINES>
+        $<$<COMPILE_LANGUAGE:CXX>:/D_USE_MATH_DEFINES>
       )
     endif()
   endforeach()
