@@ -486,6 +486,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     # Set CUTLASS_REVISION. Used for FetchContent. Also fixes some bogus messages when building.
     set(CUTLASS_REVISION "v4.7.1")
     if (WIN32)
+      # cute 4.7 does not instantiate under cl.exe (C3545 in cute/stride.hpp,
+      # then C2062/C2976 cascading through cute::Layout). 4.4.2 is what the
+      # Windows builds of vLLM have compiled against.
+      set(CUTLASS_REVISION "v4.4.2")
       set(CUTLASS_ENABLE_CUBLAS ON CACHE BOOL "cuBLAS enabled for Cutlass")
       set(CUBLAS_ENABLED ON CACHE BOOL "cuBLAS enabled")
       list(APPEND VLLM_GPU_FLAGS "--disable-warnings")

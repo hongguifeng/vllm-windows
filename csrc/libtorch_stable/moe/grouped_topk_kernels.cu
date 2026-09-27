@@ -853,7 +853,9 @@ namespace detail {
 
 static constexpr int BlockDim = 256;
 static constexpr uint32_t FullWarpMask = 0xffffffffU;
-static constexpr float InvalidScore = -INFINITY;
+// EDG rejects -INFINITY in a constexpr on MSVC; cuda::std keeps it computable.
+static constexpr float InvalidScore =
+    -cuda::std::numeric_limits<float>::infinity();
 
 // TopK-only tuning: use wider workers and keep these tiers on the block path.
 template <int MaxNumExperts, int MaxNumTopExperts>
