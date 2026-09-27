@@ -11,7 +11,7 @@ import torch
 from torch import nn
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, get_current_vllm_config_or_none
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
@@ -264,7 +264,19 @@ class DefaultModelLoader(BaseModelLoader):
                 self.load_config.use_tqdm_on_load,
             )
         elif use_safetensors:
-            if self.load_config.load_format == "fastsafetensors":
+            config = get_current_vllm_config_or_none()
+            if config is not None and config.additional_config.get("ple_ssd_offload"):
+                from vllm.models.qwen4_exp.nvidia.ple_ssd import (
+                    ple_ssd_weights_iterator,
+                )
+
+                weights_iterator = ple_ssd_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    self.load_config.safetensors_load_strategy,
+                    self.local_expert_ids,
+                )
+            elif self.load_config.load_format == "fastsafetensors":
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,

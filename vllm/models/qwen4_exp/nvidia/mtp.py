@@ -152,6 +152,11 @@ def _make_draft_vllm_config(
                 "quantized_layers",
                 _remap_quantized_layers(quantized_layers, mtp_start_layer_idx),
             )
+        extra_config = getattr(draft_quant_config, "extra_config", None)
+        if extra_config:
+            draft_quant_config.extra_config = _remap_quantized_layers(
+                extra_config, mtp_start_layer_idx
+            )
 
     draft_vllm_config = replace(
         vllm_config,

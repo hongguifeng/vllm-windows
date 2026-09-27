@@ -14,6 +14,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from vllm.compilation.breakable_cudagraph import (
+    BreakableCUDAGraphCapture,
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
 )
@@ -169,7 +170,9 @@ class CudaGraphManager:
         # dispatch() is a plain dict lookup instead of a per-call bisect.
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
 
-        self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
+        self.graphs: dict[
+            BatchExecutionDescriptor, torch.cuda.CUDAGraph | BreakableCUDAGraphCapture
+        ] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
@@ -460,7 +463,14 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        graph = torch.cuda.CUDAGraph()
+                        ssd_breaks = self.use_breakable_cg and bool(
+                            self.vllm_config.additional_config.get("ple_ssd_offload")
+                        )
+                        graph = (
+                            BreakableCUDAGraphCapture(self.pool)
+                            if ssd_breaks
+                            else torch.cuda.CUDAGraph()
+                        )
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
@@ -471,10 +481,20 @@ class CudaGraphManager:
                         if self._capture_mem_samples is not None:
                             torch.accelerator.synchronize()
                             free_before = torch.accelerator.get_memory_info()[0]
-                        with torch.cuda.graph(
-                            graph, self.pool, stream=self._capture_stream(desc)
+                        capture_context = (
+                            graph
+                            if isinstance(graph, BreakableCUDAGraphCapture)
+                            else torch.cuda.graph(
+                                graph, self.pool, stream=self._capture_stream(desc)
+                            )
+                        )
+                        with (
+                            torch.cuda.stream(self._capture_stream(desc)),
+                            capture_context,
                         ):
-                            forward_fn(CUDAGraphMode.NONE)
+                            forward_fn(
+                                CUDAGraphMode.FULL if ssd_breaks else CUDAGraphMode.NONE
+                            )
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
                             # forks copy_stream, but wait_prefetch only happens in

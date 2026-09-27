@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -25,6 +26,21 @@ class Qwen4ExpModelState(MambaHybridModelState):
         device: torch.device,
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
+        self.ple_prompt_prefetchers = []
+        prefetch_tokens = int(
+            vllm_config.additional_config.get("ple_ssd_prefetch_tokens", 0)
+        )
+        if prefetch_tokens:
+            from .ngram_embedding import Qwen4ExpNGramEmbedding
+            from .ple_ssd import PLEPromptPrefetcher, Qwen4ExpPLESSDEmbedding
+
+            for module in model.modules():
+                if isinstance(module, Qwen4ExpNGramEmbedding) and isinstance(
+                    module.ngram_embedding, Qwen4ExpPLESSDEmbedding
+                ):
+                    prefetcher = PLEPromptPrefetcher(module, prefetch_tokens)
+                    module.ngram_embedding.prompt_prefetcher = prefetcher
+                    self.ple_prompt_prefetchers.append(prefetcher)
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
         if not self.uses_ngram_embedding:
@@ -63,6 +79,21 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        super().add_request(req_index, new_req_data)
+        if new_req_data.prefill_token_ids is not None:
+            for prefetcher in self.ple_prompt_prefetchers:
+                prefetcher.submit(
+                    new_req_data.req_id,
+                    new_req_data.prefill_token_ids,
+                    new_req_data.num_computed_tokens,
+                )
+
+    def remove_request(self, req_id: str) -> None:
+        for prefetcher in self.ple_prompt_prefetchers:
+            prefetcher.cancel(req_id)
+        super().remove_request(req_id)
 
     def _prepare_ngram_context(
         self,

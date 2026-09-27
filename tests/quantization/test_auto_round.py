@@ -416,6 +416,30 @@ def test_inc_get_quant_method_unquantized_routed_experts_with_model_prefix(
     assert method.moe_config is None
 
 
+@pytest.mark.parametrize("bits", [3, 4])
+def test_inc_routed_experts_respects_per_expert_overrides(bits):
+    """Mixed-bit checkpoints describe individual experts under RoutedExperts."""
+    config = make_config(
+        weight_bits=2,
+        group_size=64,
+        block_name_to_quantize=["model.layers"],
+        extra_config={
+            f"mtp.layers.48.mlp.experts.{i}.{projection}": {
+                "bits": bits,
+                "group_size": 128,
+            }
+            for i in range(2)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        },
+    )
+    layer = object.__new__(RoutedExperts)
+    assert config.get_layer_config(layer, "mtp.layers.48.mlp.experts") == (
+        bits,
+        128,
+        True,
+    )
+
+
 def test_inc_get_quant_method_unknown_layer_with_model_prefix_returns_none() -> None:
     """``model.``-prefixed extra_config entries return None for unhandled
     layer types (non-Linear, non-MoE)."""

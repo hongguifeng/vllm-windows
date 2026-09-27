@@ -63,7 +63,7 @@ def _weak_ref_capture_arg(arg: Any) -> Any:
     return weak_ref_tensor(arg)
 
 
-def eager_break_during_capture(fn: F) -> F:
+def eager_break_during_capture(fn: F, *, always: bool = False) -> F:
     """Decorator that turns a custom-op Python kernel into a "break point"
     for the breakable cudagraph capture.
 
@@ -73,6 +73,9 @@ def eager_break_during_capture(fn: F) -> F:
     When invoked inside a capture context, it ends the current cudagraph
     segment, runs the function eagerly on the capture stream, records the
     callable for replay, and starts a fresh segment.
+
+    ``always=True`` also breaks FULL capture for operations that require
+    host execution, such as asynchronous disk offloading.
 
     **In-place output buffer required.** Decorated ops must write into a
     caller-provided output tensor; a fresh tensor returned by ``fn`` would
@@ -106,7 +109,7 @@ def eager_break_during_capture(fn: F) -> F:
             return fn(*args, **kwargs)
         if is_forward_context_available():
             mode = get_forward_context().cudagraph_runtime_mode
-            if mode == CUDAGraphMode.FULL:
+            if mode == CUDAGraphMode.FULL and not always:
                 return fn(*args, **kwargs)
 
         # Weak-ref args: strong refs in the replay lambda pin cudagraph-pool

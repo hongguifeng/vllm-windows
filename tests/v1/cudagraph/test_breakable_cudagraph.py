@@ -287,17 +287,25 @@ def test_capture_replay_matches_eager_simple(cuda_capture_stream):
     assert log == ["eager", "eager", "eager"]
 
 
-def test_decorator_breaks_when_invoked_inside_capture(cuda_capture_stream):
+@pytest.mark.parametrize("full_host_break", [False, True])
+def test_decorator_breaks_when_invoked_inside_capture(
+    cuda_capture_stream, full_host_break
+):
     """Verify @eager_break_during_capture correctly routes through
     add_eager when inside a capture context, and runs straight through
     when there's no active capture."""
+    from functools import partial
+
     from vllm.compilation.breakable_cudagraph import (
         BreakableCUDAGraphCapture,
         eager_break_during_capture,
     )
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import set_forward_context
 
-    @eager_break_during_capture
+    @partial(eager_break_during_capture, always=full_host_break)
     def attention_like(t: torch.Tensor) -> None:
+        assert not torch.cuda.is_current_stream_capturing()
         # In-place double; stands in for "real" attention work.
         t.mul_(2.0)
 
@@ -313,7 +321,16 @@ def test_decorator_breaks_when_invoked_inside_capture(cuda_capture_stream):
     # segment actually mutates state during capture.
     x.fill_(0.0)
     cap = BreakableCUDAGraphCapture()
-    with cap:
+    with (
+        set_forward_context(
+            None,
+            _mock_vllm_config(),
+            cudagraph_runtime_mode=(
+                CUDAGraphMode.FULL if full_host_break else CUDAGraphMode.PIECEWISE
+            ),
+        ),
+        cap,
+    ):
         x.add_(5.0)  # recorded
         attention_like(x)  # eager: x *= 2 (on x == 0, no-op)
         x.add_(1.0)  # recorded

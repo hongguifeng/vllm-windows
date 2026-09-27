@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import regex as re
 
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 if TYPE_CHECKING:
@@ -175,7 +176,10 @@ class INCConfigParser:
                 for name in self._config.block_name_to_quantize
             )
 
-        if self._config.extra_config and "fusedmoe" in layer.__class__.__name__.lower():
+        if self._config.extra_config and (
+            isinstance(layer, RoutedExperts)
+            or "fusedmoe" in layer.__class__.__name__.lower()
+        ):
             moe_configs = [
                 get_config(name, quantized)
                 for name in self._config.extra_config

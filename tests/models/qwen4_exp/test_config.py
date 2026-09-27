@@ -140,6 +140,34 @@ def test_qwen4_exp_mtp_override_sets_draft_config(
     assert draft_config.n_predict == 1
 
 
+def test_qwen4_exp_mtp_preserves_autoround_projection_format(monkeypatch):
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.quantization.inc import INCConfig
+    from vllm.models.qwen4_exp.nvidia import mtp
+
+    quant = INCConfig(
+        weight_bits=2,
+        group_size=64,
+        block_name_to_quantize=["model.layers"],
+        extra_config={
+            f"mtp.layers.0.self_attn.{name}_proj": {"bits": 8, "group_size": 128}
+            for name in ("q", "k", "v")
+        },
+    )
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(draft_model_config=object()),
+    )
+    monkeypatch.setattr(mtp, "get_draft_quant_config", lambda _: quant)
+    monkeypatch.setattr(
+        mtp, "replace", lambda *args, **kwargs: SimpleNamespace(**kwargs)
+    )
+    draft = mtp._make_draft_vllm_config(config, 48)
+    layer = object.__new__(LinearBase)
+    assert draft.quant_config.get_layer_config(
+        layer, "mtp.layers.48.self_attn.qkv_proj"
+    ) == (8, 128, True)
+
+
 @pytest.mark.parametrize("ple_layer_ids", [[1], []])
 def test_qwen4_exp_rejects_pipeline_parallel_only_with_ple(ple_layer_ids) -> None:
     """PLE needs raw input_ids, which non-first pipeline ranks never see. The

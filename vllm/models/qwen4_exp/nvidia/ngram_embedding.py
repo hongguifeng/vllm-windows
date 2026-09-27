@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.inc.inc import INCConfig
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
     ModelOptQuantConfigBase,
@@ -173,7 +174,8 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         """Select the concrete PLE embedding format for a layer."""
         if embedding_dtype == "float8_e4m3fn":
             return Qwen4ExpPLEFp8EmbeddingMethod()
-        if quant_config is None:
+        # INC quantizes linear layers, leaving the PLE embedding unquantized.
+        if quant_config is None or isinstance(quant_config, INCConfig):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if isinstance(quant_config, ModelOptMixedPrecisionConfig):
             if quant_config._resolve_quant_algo(prefix) == "FP8":
@@ -705,6 +707,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
+        if get_current_vllm_config().additional_config.get("ple_ssd_offload"):
+            from .ple_ssd import Qwen4ExpPLESSDEmbedding
+
+            embedding_cls = Qwen4ExpPLESSDEmbedding
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,
