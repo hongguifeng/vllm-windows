@@ -181,6 +181,12 @@ if TYPE_CHECKING:
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
+    # Build the mamba "align" block table with one Triton kernel instead of the
+    # six-aten-op path. Saves ~82 us per call at decode batch sizes.
+    VLLM_MAMBA_ALIGN_FUSED: bool = False
+    # Log per-step wall-time split (submit / wait for model output / output
+    # bookkeeping / gap between steps) every 200 steps.
+    VLLM_STEP_STATS: bool = False
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -770,6 +776,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: breakable cudagraph does not rely on torch.compile
     "VLLM_USE_BREAKABLE_CUDAGRAPH": lambda: (
         os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
+    ),
+    "VLLM_MAMBA_ALIGN_FUSED": lambda: (
+        os.environ.get("VLLM_MAMBA_ALIGN_FUSED", "0") == "1"
+    ),
+    "VLLM_STEP_STATS": lambda: (
+        os.environ.get("VLLM_STEP_STATS", "0") == "1"
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').

@@ -106,6 +106,14 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def _step_percentile(values: list[float], q: float) -> float:
+    if not values:
+        return float("nan")
+    ordered = sorted(values)
+    index = min(int(round(q * (len(ordered) - 1))), len(ordered) - 1)
+    return ordered[index]
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -131,6 +139,12 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self._step_stats = envs.VLLM_STEP_STATS
+        self._ss: dict[str, list[float]] = {
+            "submit": [], "block": [], "wait": [], "update": [], "gap": []
+        }
+        self._ss_steps = 0
+        self._ss_step_end = 0.0
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
 
@@ -641,9 +655,18 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        timing = self._step_stats
+        t_step = 0.0
+        if timing and self._ss_step_end:
+            self._ss["gap"].append(time.perf_counter() - self._ss_step_end)
+        if timing:
+            t_step = time.perf_counter()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        t_submit = time.perf_counter()
+        if timing:
+            self._ss["submit"].append(t_submit - t_step)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -651,6 +674,9 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        t_wait = time.perf_counter()
+        if timing:
+            self._ss["wait"].append(t_wait - t_submit)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -659,6 +685,24 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+
+        if timing:
+            self._ss["update"].append(time.perf_counter() - t_wait)
+            self._ss_step_end = time.perf_counter()
+            self._ss_steps += 1
+            if self._ss_steps % 200 == 0 and any(self._ss.values()):
+                parts = []
+                for name in ("submit", "wait", "update", "gap"):
+                    values = self._ss[name]
+                    if values:
+                        parts.append(
+                            f"{name} p50={_step_percentile(values, 0.5):.2f} "
+                            f"p95={_step_percentile(values, 0.95):.2f} "
+                            f"max={max(values):.2f} ms")
+                logger.info("Step stats over %d steps: %s", self._ss_steps,
+                            ", ".join(parts))
+                for bucket in self._ss.values():
+                    bucket.clear()
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -689,6 +733,13 @@ class EngineCore:
         """
         batch_queue = self.batch_queue
         assert batch_queue is not None
+
+        timing = self._step_stats
+        t_enter = 0.0
+        if timing:
+            if self._ss_step_end:
+                self._ss["gap"].append(time.perf_counter() - self._ss_step_end)
+            t_enter = time.perf_counter()
 
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
@@ -732,6 +783,11 @@ class EngineCore:
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
+                    if timing:
+                        t_now = time.perf_counter()
+                        self._ss["submit"].append(t_now - t_enter)
+                        self._ss_step_end = t_now
+                        self._ss_steps += 1
                     return None, model_executed
 
         elif not batch_queue:
@@ -741,6 +797,9 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
+        if timing:
+            t_submit_end = time.perf_counter()
+            self._ss["submit"].append(t_submit_end - t_enter)
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -760,6 +819,9 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+        t_update_start = time.perf_counter()
+        if timing:
+            self._ss["block"].append(t_update_start - t_submit_end)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -784,7 +846,30 @@ class EngineCore:
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
+        if timing:
+            self._ss["update"].append(time.perf_counter() - t_update_start)
+            self._ss_step_end = time.perf_counter()
+            self._ss_steps += 1
+            if self._ss_steps % 200 == 0:
+                self._log_step_stats()
+
         return engine_core_outputs, model_executed
+
+    def _log_step_stats(self) -> None:
+        if not any(self._ss.values()):
+            return
+        parts = []
+        for name in ("submit", "block", "update", "gap"):
+            values = self._ss[name]
+            if values:
+                parts.append(
+                    f"{name} p50={_step_percentile(values, 0.5) * 1e3:.2f} "
+                    f"p95={_step_percentile(values, 0.95) * 1e3:.2f} "
+                    f"max={max(values) * 1e3:.2f} ms")
+        logger.info("Step stats over %d steps: %s", self._ss_steps,
+                    ", ".join(parts))
+        for bucket in self._ss.values():
+            bucket.clear()
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():

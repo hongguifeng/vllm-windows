@@ -9,6 +9,7 @@ import json
 import os
 import struct
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -503,6 +504,12 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         self._previous_use.record()
         self._pending: Future | None = None
         self._coordinator = ThreadPoolExecutor(1, thread_name_prefix="ple-ssd-prefetch")
+        self._stats = os.getenv("VLLM_PLE_SSD_STATS", "0") == "1"
+        self._stat_wait = 0.0
+        self._stat_ids = 0.0
+        self._stat_read = 0.0
+        self._stat_steps = 0
+        self._stat_tokens = 0
         self._loaded_starts: set[int] = set()
         logger.info(
             "PLE SSD: %.2f GiB on disk, %d I/O workers, %d MiB row cache",
@@ -527,7 +534,10 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         self._loaded_starts.add(checkpoint_start)
 
     def _read_and_copy(self, tokens: int) -> None:
+        t0 = time.perf_counter()
         self._ids_ready.synchronize()
+        self._stat_ids += time.perf_counter() - t0
+        t0 = time.perf_counter()
         self._table.read(
             self._ids[:tokens].numpy(),
             self._host[:tokens]
@@ -535,6 +545,8 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
             .numpy()
             .reshape(-1, self._table.row_bytes),
         )
+        self._stat_read += time.perf_counter() - t0
+        self._stat_tokens += tokens
         self._copy_to_gpu(tokens)
 
     def _copy_to_gpu(self, tokens: int) -> None:
@@ -575,8 +587,29 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
             return
         if self._pending is None:
             raise RuntimeError("PLE SSD lookup was not prefetched")
+        t0 = time.perf_counter()
         self._pending.result()
+        self._stat_wait += time.perf_counter() - t0
         self._pending = None
+        self._stat_steps += 1
+        if self._stats and self._stat_steps % 200 == 0:
+            table = self._table
+            rows = table.hits + table.reads
+            logger.info(
+                "PLE SSD stats over %d steps: wait %.2f ms/step, "
+                "row assembly %.2f ms/step, ids wait %.2f ms/step, "
+                "%d rows (%.1f%% from cache)",
+                self._stat_steps,
+                1e3 * self._stat_wait / self._stat_steps,
+                1e3 * self._stat_read / self._stat_steps,
+                1e3 * self._stat_ids / self._stat_steps,
+                rows,
+                100 * table.hits / rows if rows else 0.0,
+            )
+            self._stat_wait = 0.0
+            self._stat_read = 0.0
+            self._stat_ids = 0.0
+            self._stat_steps = 0
         torch.cuda.current_stream().wait_event(self._copy_ready)
         output.copy_(self._gpu[: output.shape[0]].flatten(-2))
         self._previous_use.record()
