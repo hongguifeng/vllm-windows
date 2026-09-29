@@ -30,6 +30,60 @@ from .ngram_embedding import Qwen4ExpNGramEmbedding, Qwen4ExpPLEEmbedding
 
 logger = init_logger(__name__)
 
+_IS_WINDOWS = os.name == "nt"
+
+# Win32 constants for opening a checkpoint without tripping over other holders.
+_GENERIC_READ = 0x80000000
+_FILE_SHARE_ALL = 0x00000007
+_OPEN_EXISTING = 3
+_FILE_FLAG_RANDOM_ACCESS = 0x10000000
+
+
+def _open_read_fd(path: str) -> int:
+    """Open a read-only file descriptor that coexists with other holders.
+
+    The Windows CRT defaults to denying all sharing, so an open fails whenever an
+    antivirus or an indexer holds the file. Ask Win32 for full sharing instead and
+    wrap that handle as a CRT descriptor so positional reads work the same way.
+    On POSIX this is just ``os.open``.
+    """
+    if not _IS_WINDOWS:
+        return os.open(path, os.O_RDONLY)
+    import ctypes
+    import msvcrt
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = ctypes.c_void_p
+    k32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+    ]
+    handle = k32.CreateFileW(
+        path,
+        _GENERIC_READ,
+        _FILE_SHARE_ALL,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_RANDOM_ACCESS,
+        None,
+    )
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise OSError(ctypes.get_last_error(), f"CreateFileW failed: {path}")
+    return msvcrt.open_osfhandle(handle, os.O_BINARY)
+
+
+def _pread(fd: int, count: int, offset: int) -> bytes:
+    """Positional read. Windows has no ``os.pread``, so seek and read together."""
+    if hasattr(os, "pread"):
+        return os.pread(fd, count, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.read(fd, count)
+
 
 def ple_ssd_weights_iterator(files, use_tqdm, strategy, local_expert_ids=None):
     """Avoid mmap's commit charge for checkpoint files containing only PLE."""
@@ -63,7 +117,12 @@ def ple_ssd_weights_iterator(files, use_tqdm, strategy, local_expert_ids=None):
 
 
 class PLESSDNativeReader:
-    """Bounded Linux direct AIO; the native call releases the Python GIL."""
+    """Bounded asynchronous reads; the native call releases the Python GIL.
+
+    Linux uses direct AIO through a duplicated O_DIRECT descriptor. Windows has
+    no AIO, so the helper reads via handles it opens itself and the descriptor the
+    table already holds only serves as an identity key for that file.
+    """
 
     def __init__(self, table, library: str, depth: int) -> None:
         if not 1 <= depth <= 4096 or not 1 <= table.row_bytes <= 4096:
@@ -87,12 +146,31 @@ class PLESSDNativeReader:
         if not self._reader:
             raise OSError(ctypes.get_errno(), "PLE io_setup failed")
         try:
-            for fd in table._fds.values():
-                self._fds[fd] = os.open(
-                    f"/proc/self/fd/{fd}", os.O_RDONLY | os.O_DIRECT
-                )
-            self._parts = np.asarray(table._parts, dtype=np.int64)
-            self._parts[:, 2] = [self._fds[fd] for fd in self._parts[:, 2]]
+            if _IS_WINDOWS:
+                self._lib.rows_bind.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_wchar_p,
+                ]
+                self._lib.rows_bind.restype = ctypes.c_int
+                self._lib.rows_depth.argtypes = [ctypes.c_void_p]
+                self._lib.rows_depth.restype = ctypes.c_int
+                for filename, fd in table._fds.items():
+                    status = self._lib.rows_bind(
+                        self._reader, fd, table._paths[filename]
+                    )
+                    if status:
+                        raise OSError(-status, f"PLE bind failed: {filename}")
+                self._depth = self._lib.rows_depth(self._reader)
+                self._parts = np.asarray(table._parts, dtype=np.int64)
+            else:
+                for fd in table._fds.values():
+                    self._fds[fd] = os.open(
+                        f"/proc/self/fd/{fd}", os.O_RDONLY | os.O_DIRECT
+                    )
+                self._depth = depth
+                self._parts = np.asarray(table._parts, dtype=np.int64)
+                self._parts[:, 2] = [self._fds[fd] for fd in self._parts[:, 2]]
             self.row_bytes = table.row_bytes
         except BaseException:
             self.close()
@@ -122,6 +200,9 @@ class PLESSDNativeReader:
         if self._reader:
             self._lib.rows_close(self._reader)
             self._reader = None
+        for fd in self._fds.values():
+            os.close(fd)
+        self._fds = {}
         for fd in self._fds.values():
             os.close(fd)
         self._fds.clear()
@@ -159,6 +240,7 @@ class PLESSDTable:
         self._reading = False
         self._waiting = 0
         self._fds: dict[str, int] = {}
+        self._paths: dict[str, str] = {}
         self._parts: list[tuple[int, int, int, int]] = []
         root = Path(model_path)
         with open(root / "model.safetensors.index.json") as f:
@@ -186,9 +268,11 @@ class PLESSDTable:
                             json.loads(f.read(header_len)),
                             8 + header_len,
                         )
-                    fd = os.open(path, os.O_RDONLY)
+                    fd = _open_read_fd(str(path))
                     self._fds[filename] = fd
-                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+                    self._paths[filename] = str(path)
+                    if hasattr(os, "posix_fadvise"):
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
                 header, data_start = headers[filename]
                 info = header[key]
                 shape = info["shape"]
@@ -209,6 +293,13 @@ class PLESSDTable:
                 os.close(fd)
             raise
         self._starts = [p[0] for p in self._parts]
+        # Windows seek+read is stateful per descriptor, so workers need a lock
+        # per file; POSIX pread needs none.
+        self._locks = (
+            {fd: threading.Lock() for fd in self._fds.values()}
+            if _IS_WINDOWS
+            else {}
+        )
         self._native = None
         self._pool = None
         try:
@@ -229,7 +320,12 @@ class PLESSDTable:
             start, _, fd, offset = self._parts[
                 bisect.bisect_right(self._starts, row) - 1
             ]
-            data = os.pread(fd, self.row_bytes, offset + (row - start) * self.row_bytes)
+            offset = offset + (row - start) * self.row_bytes
+            if self._locks:
+                with self._locks[fd]:
+                    data = _pread(fd, self.row_bytes, offset)
+            else:
+                data = _pread(fd, self.row_bytes, offset)
             if len(data) != self.row_bytes:
                 raise OSError(f"Short PLE SSD read for row {row}")
             result.append((row, data))
@@ -416,7 +512,9 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         )
         if self._table._native is not None:
             logger.info(
-                "PLE SSD uses native Linux AIO, queue depth %d",
+                "PLE SSD uses native %s, queue depth %d (asked %d)",
+                "Windows overlapped reads" if _IS_WINDOWS else "Linux AIO",
+                self._table._native._depth,
                 int(options.get("ple_ssd_io_depth", 256)),
             )
 
