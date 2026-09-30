@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 import statistics
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -61,7 +62,8 @@ logger = init_logger(__name__)
 # per step idle gap the step timing windows report.
 ATTN_BUILD_TIMING = os.environ.get("VLLM_ATTN_BUILD_TIMING", "") == "1"
 ATTN_BUILD_LOG_EVERY = int(os.environ.get("VLLM_ATTN_BUILD_LOG_EVERY", "200"))
-_attn_build_samples: list[tuple[int, int, int]] = []
+_attn_build_samples: list[tuple[int, int, int, int, str]] = []
+_attn_builder_samples: list[tuple[str, int]] = []
 
 
 def _percentile(values: list[int], fraction: float) -> float:
@@ -80,9 +82,34 @@ def _log_attn_build_timing() -> None:
     counts = [sample[2] for sample in _attn_build_samples]
     p50_total = statistics.median(totals) / 1e6
     p50_builders = statistics.median(builders) / 1e6
+
+    # Separate the calls by batch size so the model step and the draft step can
+    # be told apart, then report the busiest buckets.
+    buckets: dict[int, list[int]] = {}
+    for sample in _attn_build_samples:
+        buckets.setdefault(sample[3], []).append(sample[0])
+    ordered = sorted(buckets.items(), key=lambda item: -len(item[1]))[:3]
+    parts = " | ".join(
+        f"tokens={size} n={len(values)} p50 {statistics.median(values) / 1e6:.3f} ms"
+        for size, values in ordered
+    )
+
+    # Which builder classes are slowest by total wall time over the window.
+    by_name: dict[str, list[int]] = {}
+    for name, elapsed in _attn_builder_samples:
+        by_name.setdefault(name, []).append(elapsed)
+    ranked = sorted(
+        by_name.items(), key=lambda item: -sum(item[1]))[:3]
+    top = " | ".join(
+        f"{name} n={len(values)} p50 {statistics.median(values) / 1e6:.3f} ms "
+        f"total {sum(values) / 1e6:.3f} ms"
+        for name, values in ranked
+    )
+
     logger.info(
         "Attn build timing window (n=%d, p50 total %.3f ms p95 %.3f ms max %.3f ms; "
-        "p50 in builders %.3f ms (%.1f%%), p50 builder calls %.1f)",
+        "p50 in builders %.3f ms (%.1f%%), p50 builder calls %.1f; buckets: %s; "
+        "top builders: %s)",
         len(_attn_build_samples),
         p50_total,
         _percentile(totals, 0.95) / 1e6,
@@ -90,8 +117,23 @@ def _log_attn_build_timing() -> None:
         p50_builders,
         100.0 * p50_builders / max(p50_total, 1e-9),
         statistics.median(counts),
+        parts,
+        top,
     )
+    origins: dict[str, list[int]] = {}
+    for sample in _attn_build_samples:
+        origins.setdefault(sample[4], []).append(sample[0])
+    ranked_origins = sorted(origins.items(), key=lambda item: -sum(item[1]))[:4]
+    origin_text = " | ".join(
+        f"{name} n={len(values)} p50 {statistics.median(values) / 1e6:.3f} ms "
+        f"total {sum(values) / 1e6:.3f} ms"
+        for name, values in ranked_origins
+    )
+    logger.info("Attn build origin window (n=%d; %s)", len(_attn_build_samples),
+                origin_text)
+
     _attn_build_samples.clear()
+    _attn_builder_samples.clear()
 
 
 @dataclass(frozen=True)
@@ -465,6 +507,8 @@ def build_attn_metadata(
     builder_calls = 0
     if record:
         entry_ns = time.perf_counter_ns()
+        caller = sys._getframe(1)
+        origin = f"{os.path.basename(caller.f_code.co_filename)}:{caller.f_lineno}"
 
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -551,15 +595,25 @@ def build_attn_metadata(
                     **attn_metadata_extra_kwargs,
                 )
                 if record:
-                    builder_ns += time.perf_counter_ns() - build_ns
+                    elapsed = time.perf_counter_ns() - build_ns
+                    builder_ns += elapsed
                     builder_calls += 1
+                    _attn_builder_samples.append(
+                        (type(attn_metadata_builder).__name__, elapsed)
+                    )
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
 
     if record:
         _attn_build_samples.append(
-            (time.perf_counter_ns() - entry_ns, builder_ns, builder_calls)
+            (
+                time.perf_counter_ns() - entry_ns,
+                builder_ns,
+                builder_calls,
+                num_tokens,
+                origin,
+            )
         )
         if len(_attn_build_samples) >= ATTN_BUILD_LOG_EVERY:
             _log_attn_build_timing()
