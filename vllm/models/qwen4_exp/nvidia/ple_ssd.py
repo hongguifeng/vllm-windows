@@ -166,6 +166,7 @@ class _TraceSlot:
         "events",
         "prefix",
         "h_ids_seen",
+        "h_ids_polls",
         "h_gate",
         "h_gate_end",
         "h_ids",
@@ -663,8 +664,10 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
 
     def _read_and_copy(self, tokens: int) -> None:
         t0 = time.perf_counter()
+        polls = 0
         if self._ids_poll:
             while not self._ids_ready.query():
+                polls += 1
                 time.sleep(0.0002)
         else:
             self._ids_ready.synchronize()
@@ -673,6 +676,7 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         if slot is not None:
             slot.h_ids = t0
             slot.h_ids_end = time.perf_counter()
+            slot.h_ids_polls = polls
         t0 = time.perf_counter()
         self._table.read(
             self._ids[:tokens].numpy(),
@@ -811,6 +815,20 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
                 1e6 * _ms_percentile(host["rows"], 0.95),
                 1e6 * _ms_percentile(host["pending"], 0.5),
                 1e6 * _ms_percentile(host["pending"], 0.95),
+            )
+            logger.info(
+                "PLE trace ids (tokens=%d): wait p50 %.2f p95 %.2f us, "
+                "polls p50 %.1f, us per poll %.2f, seen true by main thread "
+                "in %d of %d steps",
+                tokens,
+                1e6 * _ms_percentile(host["ids"], 0.5),
+                1e6 * _ms_percentile(host["ids"], 0.95),
+                _percentile([s.h_ids_polls for s in slots], 0.5),
+                1e6
+                * _ms_percentile(host["ids"], 0.5)
+                / max(_percentile([s.h_ids_polls for s in slots], 0.5), 1.0),
+                sum(1 for s in slots if s.h_ids_seen > 0.0),
+                len(slots),
             )
             logger.info(
                 "PLE trace prefix (tokens=%d): model dispatch to preserve "
