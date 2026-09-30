@@ -184,6 +184,7 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 logger = init_logger(__name__)
 
 _PLE_TRACE = os.environ.get("VLLM_PLE_SSD_TRACE", "0") == "1"
+_PLE_WITNESS = os.environ.get("VLLM_PLE_SNAPSHOT_WITNESS", "0") == "1"
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1629,6 +1630,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    def _record_ple_witness(self, input_batch: InputBatch) -> None:
+        """Note what the host already holds just before this step runs.
+
+        Reports presence and time only. It reads no device state, so a value that
+        still needs a transfer is never reported as available.
+        """
+        self._witness_steps = getattr(self, "_witness_steps", 0) + 1
+        if self._witness_steps % 50:
+            return
+        active = input_batch.num_reqs
+        computed = self.req_states.num_computed_tokens_np
+        logger.info(
+            "PLE snapshot witness step=%d reqs=%d padded=%d drafts_on_host=%s "
+            "computed_np_max=%d t=%.6f",
+            self._witness_steps,
+            active,
+            input_batch.num_reqs_after_padding,
+            self.draft_tokens_handler.draft_tokens_np is not None,
+            int(computed[:active].max()) if active else 0,
+            time.perf_counter(),
+        )
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1905,6 +1928,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             from vllm.models.qwen4_exp.nvidia.ple_ssd import record_step_prefix
 
             record_step_prefix()
+
+        if _PLE_WITNESS:
+            self._record_ple_witness(input_batch)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
