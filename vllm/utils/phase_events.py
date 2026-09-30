@@ -112,7 +112,7 @@ class PhaseEvents:
             if not self._recorded.get(name):
                 continue
             if start.query() and end.query():
-                samples.append(end.elapsed_time(start))
+                samples.append(start.elapsed_time(end))
         self._harvests += 1
         if self._harvests == 1:
             logger.info(
