@@ -531,15 +531,24 @@ class Qwen4ExpModel(nn.Module):
             self.layers[layer_idx].phase_events = events
 
         detail = {layer for layer in (ple_layer, two_thirds) if layer in picks}
+        # Inner phases are found by the attribute that actually exists: the
+        # attention module is linear_attn or self_attn, never plain attn.
+        parts = (
+            ("ple", "ple"),
+            ("attn", "linear_attn"),
+            ("attn", "self_attn"),
+            ("mlp", "mlp"),
+        )
         for layer_idx in sorted(detail):
-            for part in ("ple", "attn", "mlp"):
-                if getattr(self.layers[layer_idx], part, None) is not None:
+            for part, attr in parts:
+                if getattr(self.layers[layer_idx], attr, None) is not None:
                     events.register(f"layer{layer_idx}.{part}")
+
         logger.info(
-            "Phase plan: layers %s, detail %s, %d pairs",
+            "Phase plan: layers %s, detail %s, phases %s",
             sorted(picks),
             sorted(detail),
-            len(events.names()),
+            events.names(),
         )
         activate(events)
         return events
