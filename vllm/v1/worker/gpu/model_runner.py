@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -181,6 +182,8 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+_PLE_TRACE = os.environ.get("VLLM_PLE_SSD_TRACE", "0") == "1"
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1897,6 +1900,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             request_ids=input_batch.req_ids,
             num_tokens=input_batch.num_tokens,
         )
+
+        if _PLE_TRACE:
+            from vllm.models.qwen4_exp.nvidia.ple_ssd import record_step_prefix
+
+            record_step_prefix()
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:

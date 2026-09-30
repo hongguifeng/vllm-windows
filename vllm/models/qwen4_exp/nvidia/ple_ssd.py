@@ -10,7 +10,7 @@ import os
 import struct
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
@@ -134,6 +134,28 @@ def _ms_percentile(values: list[float], q: float) -> float:
 
 TRACE_STEPS = 200
 TRACE_MARKS = 8
+TRACE_ENABLED = os.getenv("VLLM_PLE_SSD_TRACE", "0") == "1"
+
+# The host measures the ids wait from its own clock, so whatever the main
+# stream already queued ahead of the preserve point is invisible to it. This
+# ring marks where each step's model dispatch begins, which puts that prefix on
+# the same device clock the intervals use.
+_prefix_free: deque[torch.cuda.Event] = deque()
+_prefix_pending: deque[torch.cuda.Event] = deque()
+
+
+def record_step_prefix() -> None:
+    """Mark the start of a step's model work. Called only while tracing."""
+    if not TRACE_ENABLED or torch.cuda.is_current_stream_capturing():
+        return
+    if _prefix_free:
+        event = _prefix_free.popleft()
+    else:
+        event = torch.cuda.Event(enable_timing=True)
+    event.record(torch.cuda.current_stream())
+    _prefix_pending.append(event)
+    while len(_prefix_pending) > TRACE_STEPS:
+        _prefix_free.append(_prefix_pending.popleft())
 
 
 class _TraceSlot:
@@ -142,6 +164,8 @@ class _TraceSlot:
     __slots__ = (
         "tokens",
         "events",
+        "prefix",
+        "h_ids_seen",
         "h_gate",
         "h_gate_end",
         "h_ids",
@@ -155,7 +179,8 @@ class _TraceSlot:
     def __init__(self, events: list[torch.cuda.Event]) -> None:
         self.tokens = 0
         self.events = events
-        for name in self.__slots__[2:]:
+        self.prefix = None
+        for name in self.__slots__[3:]:
             setattr(self, name, 0.0)
 
 
@@ -693,6 +718,7 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
             slot = self._trace_pool[self._trace_index]
             self._trace_index = (self._trace_index + 1) % TRACE_STEPS
             slot.tokens = tokens
+            slot.prefix = _prefix_pending.pop() if _prefix_pending else None
             self._trace_active.append(slot)
             self._trace_slot = slot
             slot.h_gate = time.perf_counter()
@@ -738,6 +764,7 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
             slots = groups[tokens]
             device: dict[str, list[float]] = {name: [] for name in names}
             device["chain"] = []
+            device["prefix"] = []
             host: dict[str, list[float]] = {
                 "gate": [],
                 "ids": [],
@@ -752,6 +779,8 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
                     device[name].append(value)
                     total += value
                 device["chain"].append(total)
+                if slot.prefix is not None:
+                    device["prefix"].append(slot.prefix.elapsed_time(events[0]))
                 host["gate"].append(slot.h_gate_end - slot.h_gate)
                 host["ids"].append(slot.h_ids_end - slot.h_ids)
                 host["rows"].append(slot.h_rows - slot.h_ids_end)
@@ -783,6 +812,18 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
                 1e6 * _ms_percentile(host["pending"], 0.5),
                 1e6 * _ms_percentile(host["pending"], 0.95),
             )
+            logger.info(
+                "PLE trace prefix (tokens=%d): model dispatch to preserve "
+                "p50 %.2f p95 %.2f us over %d steps",
+                tokens,
+                1e3 * _ms_percentile(device["prefix"], 0.5),
+                1e3 * _ms_percentile(device["prefix"], 0.95),
+                len(device["prefix"]),
+            )
+            for slot in slots:
+                if slot.prefix is not None:
+                    _prefix_free.append(slot.prefix)
+                    slot.prefix = None
         self._trace_active = []
 
     @partial(eager_break_during_capture, always=True)
@@ -799,6 +840,9 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         if slot is not None:
             slot.h_pending = t0
             slot.h_pending_end = time.perf_counter()
+            slot.h_ids_seen = (
+                time.perf_counter() if self._ids_ready.query() else 0.0
+            )
             slot.events[7].record(torch.cuda.current_stream())
         self._pending = None
         self._trace_slot = None
