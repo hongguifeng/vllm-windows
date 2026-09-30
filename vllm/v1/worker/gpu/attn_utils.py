@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import statistics
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -13,6 +16,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
 )
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -47,6 +51,47 @@ if TYPE_CHECKING:
         BatchExecutionDescriptor,
         CudaGraphManager,
     )
+
+
+logger = init_logger(__name__)
+
+# Optional host side timing of attention metadata construction, switched on with
+# VLLM_ATTN_BUILD_TIMING=1. Reports the p50 and p95 wall time of the whole build
+# and of the per group builder calls, so this cost can be lined up against the
+# per step idle gap the step timing windows report.
+ATTN_BUILD_TIMING = os.environ.get("VLLM_ATTN_BUILD_TIMING", "") == "1"
+ATTN_BUILD_LOG_EVERY = int(os.environ.get("VLLM_ATTN_BUILD_LOG_EVERY", "200"))
+_attn_build_samples: list[tuple[int, int, int]] = []
+
+
+def _percentile(values: list[int], fraction: float) -> float:
+    """Return the interpolation free percentile of a list of nanosecond counts."""
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(fraction * (len(ordered) - 1)))
+    return float(ordered[index])
+
+
+def _log_attn_build_timing() -> None:
+    """Log recent attention metadata build durations and drop them."""
+    if not _attn_build_samples:
+        return
+    totals = [sample[0] for sample in _attn_build_samples]
+    builders = [sample[1] for sample in _attn_build_samples]
+    counts = [sample[2] for sample in _attn_build_samples]
+    p50_total = statistics.median(totals) / 1e6
+    p50_builders = statistics.median(builders) / 1e6
+    logger.info(
+        "Attn build timing window (n=%d, p50 total %.3f ms p95 %.3f ms max %.3f ms; "
+        "p50 in builders %.3f ms (%.1f%%), p50 builder calls %.1f)",
+        len(_attn_build_samples),
+        p50_total,
+        _percentile(totals, 0.95) / 1e6,
+        max(totals) / 1e6,
+        p50_builders,
+        100.0 * p50_builders / max(p50_total, 1e-9),
+        statistics.median(counts),
+    )
+    _attn_build_samples.clear()
 
 
 @dataclass(frozen=True)
@@ -415,6 +460,12 @@ def build_attn_metadata(
     fast_prefill: FastPrefillBatchMetadata | None = None,
     req_idx: np.ndarray | None = None,
 ) -> dict[str, Any]:
+    record = ATTN_BUILD_TIMING and not for_cudagraph_capture
+    builder_ns = 0
+    builder_calls = 0
+    if record:
+        entry_ns = time.perf_counter_ns()
+
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
@@ -484,6 +535,8 @@ def build_attn_metadata(
                     common_attn_metadata
                 )
             else:
+                if record:
+                    build_ns = time.perf_counter_ns()
                 attn_metadata_extra_kwargs = (
                     model_specific_attn_metadata.get_extra_attn_kwargs(
                         attn_metadata_builder,
@@ -497,9 +550,20 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+                if record:
+                    builder_ns += time.perf_counter_ns() - build_ns
+                    builder_calls += 1
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
+
+    if record:
+        _attn_build_samples.append(
+            (time.perf_counter_ns() - entry_ns, builder_ns, builder_calls)
+        )
+        if len(_attn_build_samples) >= ATTN_BUILD_LOG_EVERY:
+            _log_attn_build_timing()
+
     return attn_metadata
 
 
