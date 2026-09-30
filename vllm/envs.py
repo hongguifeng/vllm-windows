@@ -187,6 +187,12 @@ if TYPE_CHECKING:
     # Log per-step wall-time split (submit / wait for model output / output
     # bookkeeping / gap between steps) every 200 steps.
     VLLM_STEP_STATS: bool = False
+    # Serve repeat Triton launches from a cached compiled kernel, skipping the
+    # Python dispatch front end. Falls back on anything not fully understood.
+    VLLM_TRITON_PREPARED_LAUNCH: bool = False
+    # Re-check every prepared-launch cache hit against Triton's own cache key.
+    # Slow, but proves the cheap key never picks the wrong compiled kernel.
+    VLLM_TRITON_PREPARED_LAUNCH_STRICT: bool = False
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -782,6 +788,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_STEP_STATS": lambda: (
         os.environ.get("VLLM_STEP_STATS", "0") == "1"
+    ),
+    "VLLM_TRITON_PREPARED_LAUNCH": lambda: (
+        os.environ.get("VLLM_TRITON_PREPARED_LAUNCH", "0") == "1"
+    ),
+    "VLLM_TRITON_PREPARED_LAUNCH_STRICT": lambda: (
+        os.environ.get("VLLM_TRITON_PREPARED_LAUNCH_STRICT", "0") == "1"
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').

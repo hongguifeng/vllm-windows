@@ -470,6 +470,10 @@ class Worker(WorkerBase):
             _num_workspace_lanes(self.vllm_config, self.use_v2_model_runner),
         )
 
+        from vllm.triton_utils.prepared import install_prepared_launch
+
+        install_prepared_launch()
+
         # Construct the model runner
         if self.use_v2_model_runner:
             if self.vllm_config.is_mm_encoder_only:
