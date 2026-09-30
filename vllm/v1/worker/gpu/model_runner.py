@@ -185,6 +185,7 @@ logger = init_logger(__name__)
 
 _PLE_TRACE = os.environ.get("VLLM_PLE_SSD_TRACE", "0") == "1"
 _PLE_WITNESS = os.environ.get("VLLM_PLE_SNAPSHOT_WITNESS", "0") == "1"
+_STEP_TIMING = int(os.environ.get("VLLM_STEP_TIMING_WINDOW", "0"))
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1630,6 +1631,63 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    def _step_timing_window(self) -> None:
+        """Open a production step-timing window and report it when it fills.
+
+        The collector resolves a window behind one device sync, so the timed steps
+        pay nothing on the path being measured, and closing between steps keeps that
+        sync off the critical path of any step.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if getattr(self, "_timing_cm", None) is None:
+            self._timing_cm = self.step_timing.collect()
+            self._timing_samples = self._timing_cm.__enter__()
+            self._timing_left = _STEP_TIMING
+            self._timing_opened = time.perf_counter()
+            return
+        self._timing_left -= 1
+        if self._timing_left > 0:
+            return
+        self._timing_cm.__exit__(None, None, None)
+        self._report_step_timing(self._timing_samples, self._timing_opened)
+        self._timing_cm = None
+
+    def _report_step_timing(self, samples: list, opened: float) -> None:
+        """Report the device span inside a step and how much wall it fills."""
+        full = [s for s in samples if s.full_cudagraph]
+        if not full:
+            return
+        wall_ms = (time.perf_counter() - opened) * 1000.0
+        if wall_ms <= 0.0:
+            return
+        busy = 100.0 * sum(s.forward_ms + s.drafter_ms for s in full) / wall_ms
+        groups: dict[int, list] = {}
+        for sample in full:
+            groups.setdefault(sample.num_target_tokens, []).append(sample)
+        top = sorted(groups.items(), key=lambda item: -len(item[1]))[:2]
+        for tokens, group in top:
+            n = len(group)
+            p95 = -max(1, n // 10)
+            fw = sorted(s.forward_ms for s in group)
+            dr = sorted(s.drafter_ms for s in group)
+            span = sorted(s.forward_ms + s.drafter_ms for s in group)
+            logger.info(
+                "Step timing window (full, tokens=%d, n=%d, wall %.1f ms): "
+                "forward p50 %.3f p95 %.3f; drafter p50 %.3f p95 %.3f; "
+                "step span p50 %.3f p95 %.3f ms; device busy %.1f%%",
+                tokens,
+                n,
+                wall_ms,
+                fw[n // 2],
+                fw[p95],
+                dr[n // 2],
+                dr[p95],
+                span[n // 2],
+                span[p95],
+                busy,
+            )
+
     def _record_ple_witness(self, input_batch: InputBatch) -> None:
         """Note what the host already holds just before this step runs.
 
@@ -1911,6 +1969,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(
             self.model_config, input_batch.num_tokens, ubatch_slices
         )
+
+        if _STEP_TIMING:
+            self._step_timing_window()
 
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
