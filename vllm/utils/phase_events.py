@@ -33,6 +33,22 @@ def phase_events_enabled() -> bool:
     return os.environ.get("VLLM_PHASE_EVENTS", "0") == "1"
 
 
+# The plan runs where the model is built. The worker finds the same object here
+# instead of walking a module tree whose shape depends on the architecture.
+_ACTIVE: PhaseEvents | None = None
+
+
+def activate(events: PhaseEvents) -> None:
+    """Make this the object the worker harvests."""
+    global _ACTIVE
+    _ACTIVE = events
+
+
+def get_active() -> PhaseEvents | None:
+    """The object the worker should harvest, if one was planned."""
+    return _ACTIVE
+
+
 class PhaseEvents:
     """Named start/end event pairs recorded on the forward stream.
 

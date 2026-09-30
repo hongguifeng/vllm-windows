@@ -64,6 +64,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+from vllm.utils.phase_events import get_active as get_phase_events
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, async_tensor_h2d
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -857,7 +858,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Pairs recorded during the step that just launched may still be in
         # flight; harvest only reads the ones already complete, so this costs a
         # few queries and never a device synchronization.
-        phase_events = getattr(self.model, "phase_events", None)
+        phase_events = get_phase_events()
         if phase_events is not None:
             phase_events.harvest()
 

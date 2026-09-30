@@ -72,7 +72,7 @@ from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
-from vllm.utils.phase_events import PhaseEvents, phase_events_enabled
+from vllm.utils.phase_events import PhaseEvents, activate, phase_events_enabled
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -532,6 +532,7 @@ class Qwen4ExpModel(nn.Module):
             for part in ("ple", "attn", "mlp"):
                 if getattr(self.layers[layer_idx], part, None) is not None:
                     events.register(f"layer{layer_idx}.{part}")
+        activate(events)
         return events
 
     @staticmethod
