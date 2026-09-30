@@ -767,6 +767,14 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         groups: dict[int, list[_TraceSlot]] = {}
         for slot in self._trace_active:
             groups.setdefault(slot.tokens, []).append(slot)
+        gaps: dict[int, list[float]] = {}
+        previous: _TraceSlot | None = None
+        for slot in self._trace_active:
+            if previous is not None and previous.h_pending > 0.0:
+                gaps.setdefault(slot.tokens, []).append(
+                    previous.events[7].elapsed_time(slot.events[5])
+                )
+            previous = slot
         for tokens in sorted(groups):
             slots = groups[tokens]
             device: dict[str, list[float]] = {name: [] for name in names}
@@ -834,6 +842,15 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
                 len(slots),
                 sum(1 for s in slots if s.h_ids_seen > 0.0),
                 len(slots),
+            )
+            gap = gaps.get(tokens, [])
+            logger.info(
+                "PLE trace step gap (tokens=%d): previous consumer to ids "
+                "landed p50 %.2f p95 %.2f us over %d steps",
+                tokens,
+                1e3 * _ms_percentile(gap, 0.5),
+                1e3 * _ms_percentile(gap, 0.95),
+                len(gap),
             )
             logger.info(
                 "PLE trace prefix (tokens=%d): model dispatch to preserve "
