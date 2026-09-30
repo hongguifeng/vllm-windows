@@ -218,7 +218,11 @@ static int start_req(struct reader* r, unsigned slot, int fd, uint64_t offset,
   req->ov.hEvent = r->events[slot];
   unsigned delta = (unsigned)(offset & (PAGE - 1));
   long long page = (long long)(offset & ~(uint64_t)(PAGE - 1));
-  if (page + (long long)(delta + row_bytes) > b->size) {
+  /* What decides whether we can use the unbuffered handle is the page-rounded
+   * request, not the logical end of the row: a row that ends exactly at the end
+   * of the file can still sit in a page that runs past it. */
+  unsigned rounded = (delta + row_bytes + PAGE - 1) & ~(PAGE - 1);
+  if (page + (long long)rounded > b->size) {
     /* The page would run past the end of the file, which an unbuffered handle
      * cannot deliver. Read exactly the row, buffered, straight into dst. */
     req->exact = 1;
@@ -241,8 +245,7 @@ static int start_req(struct reader* r, unsigned slot, int fd, uint64_t offset,
   req->need = delta + row_bytes;
   req->ov.Offset = (DWORD)(page & 0xFFFFFFFF);
   req->ov.OffsetHigh = (DWORD)((page >> 32) & 0xFFFFFFFF);
-  unsigned need = (delta + row_bytes + PAGE - 1) & ~(PAGE - 1);
-  if (!ReadFile(b->direct, req->slot, need, NULL, &req->ov)) {
+  if (!ReadFile(b->direct, req->slot, rounded, NULL, &req->ov)) {
     int err = (int)GetLastError();
     if (err != ERROR_IO_PENDING) {
       errno = err;

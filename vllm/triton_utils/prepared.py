@@ -41,7 +41,7 @@ _KNOWN_ATTRS = frozenset({"D", "1"})
 _MAX_ENTRIES = 32
 
 _ORIG_RUN = None
-_stats = {"fast": 0, "full": 0, "checked": 0, "mismatch": 0}
+_stats = {"fast": 0, "full": 0, "checked": 0, "mismatch": 0, "fallback": 0}
 _strict = False
 
 
@@ -287,7 +287,7 @@ def install_prepared_launch(strict: bool | None = None) -> bool:
                 entry = cache.get(key)
                 if entry is not None and entry.usable():
                     if _strict:
-                        _strict_check(self, entry, args, kwargs)
+                        agreed = _strict_check(self, entry, args, kwargs)
                         _stats["checked"] += 1
                         if _stats["checked"] % 2000 == 0:
                             logger.info(
@@ -296,6 +296,12 @@ def install_prepared_launch(strict: bool | None = None) -> bool:
                                 _stats["checked"],
                                 _stats["mismatch"],
                             )
+                        if not agreed:
+                            # Triton's own dispatch picked something else, so let
+                            # it launch instead of trusting the cached kernel.
+                            _stats["fallback"] += 1
+                            return _ORIG_RUN(self, *args, grid=grid,
+                                             warmup=warmup, **kwargs)
                     return entry.launch(grid, args, kwargs)
         compiled = _ORIG_RUN(self, *args, grid=grid, warmup=warmup, **kwargs)
         _stats["full"] += 1
