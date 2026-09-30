@@ -854,6 +854,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.step_timing.forward_end()
 
+        # Pairs recorded during the step that just launched may still be in
+        # flight; harvest only reads the ones already complete, so this costs a
+        # few queries and never a device synchronization.
+        phase_events = getattr(self.model, "phase_events", None)
+        if phase_events is not None:
+            phase_events.harvest()
+
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
             assert self.sampler is not None

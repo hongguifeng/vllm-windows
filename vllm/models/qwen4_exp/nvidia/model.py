@@ -72,6 +72,7 @@ from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.phase_events import PhaseEvents, phase_events_enabled
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -186,6 +187,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.config = config
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        self.phase_events: PhaseEvents | None = None
         if vllm_config.parallel_config.use_sequence_parallel_moe:
             raise NotImplementedError(
                 "Qwen4Exp HC does not support sequence-parallel MoE"
@@ -287,6 +289,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if prev_block_output is None:
             assert prev_injection is None
         attn_hc = self.attn_hyper_connection
+        pe = self.phase_events
+        if pe is not None:
+            pe.begin(f"layer{self.layer_idx}")
         if self.ple is not None:
             # PLE adds directly to the multi-stream state, so pending HC state
             # must be materialized before the addition.
@@ -298,12 +303,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
+            if pe is not None:
+                pe.begin(f"layer{self.layer_idx}.ple")
             hidden_states = self.ple(
                 hidden_states,
                 input_ids,
                 query_start_loc,
                 ngram_context,
             )
+            if pe is not None:
+                pe.end(f"layer{self.layer_idx}.ple")
 
         # Fuse a pending combine with this HC module's mix when possible.
         if prev_block_output is not None:
@@ -313,6 +322,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
+        if pe is not None:
+            pe.begin(f"layer{self.layer_idx}.attn")
         if self.layer_type == "linear_attention":
             attn_out = self.linear_attn(hidden_states=block_input)
         elif self.layer_type in ATTENTION_LAYER_TYPES:
@@ -322,12 +333,19 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         else:
             raise ValueError("Invalid layer_type")
+        if pe is not None:
+            pe.end(f"layer{self.layer_idx}.attn")
 
         mlp_hc = self.mlp_hyper_connection
         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
             hidden_states, attn_out, injection
         )
+        if pe is not None:
+            pe.begin(f"layer{self.layer_idx}.mlp")
         mlp_out = self.mlp(block_input)
+        if pe is not None:
+            pe.end(f"layer{self.layer_idx}.mlp")
+            pe.end(f"layer{self.layer_idx}")
         return hidden_states, mlp_out, injection
 
 
@@ -462,8 +480,59 @@ class Qwen4ExpModel(nn.Module):
         else:
             self._mtp_hidden_buffer = None
 
+        self.phase_events = self._plan_phase_events()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+    def _plan_phase_events(self) -> PhaseEvents | None:
+        """Pick the layer spans and inner phases that get an event pair.
+
+        A dozen pairs cost a fraction of a step, so sample the two ends of the
+        stack, a third and two thirds through it, the PLE layer and the first
+        and last sparse-attention layer, because the stack mixes
+        GatedDeltaNet with QSA layers and every layer carries a routed-expert
+        MLP. Inner phases are timed on the PLE layer and on the two-thirds
+        layer; whatever the inner spans do not account for is hyper-connection
+        work.
+        """
+        if not phase_events_enabled():
+            return None
+        span = self.end_layer - self.start_layer
+        if span <= 0:
+            return None
+        two_thirds = self.start_layer + (2 * span) // 3
+        picks = {
+            self.start_layer,
+            self.start_layer + span // 3,
+            two_thirds,
+            self.end_layer - 1,
+        }
+        ple_layer = None
+        for layer_idx in range(self.start_layer, self.end_layer):
+            if self.layers[layer_idx].ple is not None:
+                ple_layer = layer_idx
+                picks.add(layer_idx)
+                break
+        qsa = sorted(
+            self._qsa_layer_ids & set(range(self.start_layer, self.end_layer))
+        )
+        if qsa:
+            picks.update((qsa[0], qsa[-1]))
+
+        events = PhaseEvents()
+        events.register("model")
+        events.register("logits")
+        for layer_idx in sorted(picks):
+            events.register(f"layer{layer_idx}")
+            self.layers[layer_idx].phase_events = events
+
+        detail = {layer for layer in (ple_layer, two_thirds) if layer in picks}
+        for layer_idx in sorted(detail):
+            for part in ("ple", "attn", "mlp"):
+                if getattr(self.layers[layer_idx], part, None) is not None:
+                    events.register(f"layer{layer_idx}.{part}")
+        return events
 
     @staticmethod
     def _start_layer_ple_prefetch(
@@ -496,6 +565,10 @@ class Qwen4ExpModel(nn.Module):
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        pe = self.phase_events
+        if pe is not None:
+            pe.begin("model")
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -587,6 +660,8 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if pe is not None:
+            pe.end("model")
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -684,6 +759,7 @@ class Qwen4ExpForCausalLM(
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.phase_events = self.model.phase_events
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
@@ -841,7 +917,13 @@ class Qwen4ExpForCausalLM(
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        pe = self.phase_events
+        if pe is not None:
+            pe.begin("logits")
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if pe is not None:
+            pe.end("logits")
+        return logits
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer
