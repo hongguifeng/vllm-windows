@@ -588,6 +588,10 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         self._stat_steps = 0
         self._stat_tokens = 0
         self._trace = os.getenv("VLLM_PLE_SSD_TRACE", "0") == "1"
+        # Waiting on an event keeps the interpreter lock, so a coordinator that
+        # blocks there stops the thread that is trying to submit the next step.
+        # Polling yields the lock instead, at the cost of coarse wake-up timing.
+        self._ids_poll = os.getenv("VLLM_PLE_SSD_IDS_POLL", "0") == "1"
         # Events are made once, eight per traced step, and read only when a
         # window closes, so timing never costs a synchronization on the path
         # being timed. Device marks pair up through torch's elapsed_time, which
@@ -607,6 +611,8 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
                 for i in range(TRACE_STEPS)
             ]
             logger.info("PLE SSD timeline tracing on, %d steps per window", TRACE_STEPS)
+        if self._ids_poll:
+            logger.info("PLE SSD ids wait polls instead of blocking on the event")
         self._loaded_starts: set[int] = set()
         logger.info(
             "PLE SSD: %.2f GiB on disk, %d I/O workers, %d MiB row cache",
@@ -632,7 +638,11 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
 
     def _read_and_copy(self, tokens: int) -> None:
         t0 = time.perf_counter()
-        self._ids_ready.synchronize()
+        if self._ids_poll:
+            while not self._ids_ready.query():
+                time.sleep(0.0002)
+        else:
+            self._ids_ready.synchronize()
         self._stat_ids += time.perf_counter() - t0
         slot = self._trace_slot
         if slot is not None:
