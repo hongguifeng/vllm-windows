@@ -855,13 +855,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.step_timing.forward_end()
 
-        # Pairs recorded during the step that just launched may still be in
-        # flight; harvest only reads the ones already complete, so this costs a
-        # few queries and never a device synchronization.
-        phase_events = get_phase_events()
-        if phase_events is not None:
-            phase_events.harvest()
-
         # dummy run the eagle speculator's propose to ensure DP/EP sync.
         if self.speculator is not None:
             assert self.sampler is not None
@@ -2116,6 +2109,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         routed_experts = self.execute_model_state.routed_experts
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         self.execute_model_state = None
+
+        # The step that just ran left its phase records behind, possibly still
+        # in flight; harvest reads only the ones already complete, so this costs
+        # a few queries and never a device synchronization.
+        phase_events = get_phase_events()
+        if phase_events is not None:
+            phase_events.harvest()
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced
