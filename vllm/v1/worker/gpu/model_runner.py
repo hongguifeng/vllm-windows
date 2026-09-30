@@ -2235,6 +2235,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
+            self.step_timing.forward_end()
+            self.step_timing.drafter_start()
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2251,6 +2253,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync=dp_sync,
                     mm_inputs=mm_inputs,
                 )
+            self.step_timing.drafter_end()
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
