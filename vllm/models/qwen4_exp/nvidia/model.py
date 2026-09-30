@@ -65,6 +65,7 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
@@ -81,6 +82,8 @@ from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ple_layer import Qwen4ExpPLELayer
 from .qsa import Qwen4ExpQSAAttention
+
+logger = init_logger(__name__)
 
 
 def without_modelopt_fp4(
@@ -532,6 +535,12 @@ class Qwen4ExpModel(nn.Module):
             for part in ("ple", "attn", "mlp"):
                 if getattr(self.layers[layer_idx], part, None) is not None:
                     events.register(f"layer{layer_idx}.{part}")
+        logger.info(
+            "Phase plan: layers %s, detail %s, %d pairs",
+            sorted(picks),
+            sorted(detail),
+            len(events.names()),
+        )
         activate(events)
         return events
 

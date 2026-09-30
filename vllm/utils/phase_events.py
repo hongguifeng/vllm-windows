@@ -42,6 +42,7 @@ def activate(events: PhaseEvents) -> None:
     """Make this the object the worker harvests."""
     global _ACTIVE
     _ACTIVE = events
+    logger.info("Phase observer armed: %d pairs", len(events.names()))
 
 
 def get_active() -> PhaseEvents | None:
@@ -73,6 +74,10 @@ class PhaseEvents:
                 torch.cuda.Event(enable_timing=True),
                 torch.cuda.Event(enable_timing=True),
             )
+
+    def names(self) -> list[str]:
+        """The phase names that have been registered."""
+        return sorted(self._pairs)
 
     def begin(self, name: str) -> None:
         pair = self._pairs.get(name)
@@ -109,6 +114,12 @@ class PhaseEvents:
             if start.query() and end.query():
                 samples.append(end.elapsed_time(start))
         self._harvests += 1
+        if self._harvests == 1:
+            logger.info(
+                "Phase harvest first call: %d pairs, %d closed",
+                len(self._pairs),
+                len(self._recorded),
+            )
         if self._harvests % self._log_every == 0:
             self.log()
 
