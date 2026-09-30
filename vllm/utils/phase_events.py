@@ -61,6 +61,7 @@ class PhaseEvents:
         if log_every <= 0:
             log_every = int(os.environ.get("VLLM_PHASE_EVENTS_LOG_EVERY", "2000"))
         self._pairs: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+        self._recorded: dict[str, bool] = {}
         self._samples: dict[str, list[float]] = defaultdict(list)
         self._log_every = max(1, log_every)
         self._harvests = 0
@@ -82,6 +83,10 @@ class PhaseEvents:
         pair = self._pairs.get(name)
         if pair is not None:
             pair[1].record()
+            # Querying an event that was never recorded reports it as complete,
+            # so elapsed time needs its own guard, set where python does run:
+            # at capture time, or eagerly. Replay re-records without running.
+            self._recorded[name] = True
 
     def harvest(self) -> None:
         """Read every pair whose latest records have completed.
@@ -90,9 +95,16 @@ class PhaseEvents:
         replays a graph. Pairs still in flight stay unread until a later
         harvest finds both of them complete, so no step waits on the device.
         """
+        if torch.cuda.is_current_stream_capturing():
+            # Records made while capturing are deferred into the graph, so a
+            # query here would report them complete and elapsed time would be
+            # meaningless. Wait for a replay instead.
+            return
         for name, (start, end) in self._pairs.items():
             samples = self._samples[name]
             if len(samples) >= MAX_SAMPLES:
+                continue
+            if not self._recorded.get(name):
                 continue
             if start.query() and end.query():
                 samples.append(end.elapsed_time(start))
