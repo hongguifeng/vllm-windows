@@ -125,6 +125,40 @@ def _percentile(values: list[int], q: float) -> int:
     return ordered[min(int(q * (len(ordered) - 1)), len(ordered) - 1)]
 
 
+def _ms_percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    return ordered[min(int(q * (len(ordered) - 1)), len(ordered) - 1)]
+
+
+TRACE_STEPS = 200
+TRACE_MARKS = 8
+
+
+class _TraceSlot:
+    """One step's timeline marks, preallocated so tracing allocates nothing."""
+
+    __slots__ = (
+        "tokens",
+        "events",
+        "h_gate",
+        "h_gate_end",
+        "h_ids",
+        "h_ids_end",
+        "h_rows",
+        "h_h2d",
+        "h_pending",
+        "h_pending_end",
+    )
+
+    def __init__(self, events: list[torch.cuda.Event]) -> None:
+        self.tokens = 0
+        self.events = events
+        for name in self.__slots__[2:]:
+            setattr(self, name, 0.0)
+
+
 class PLESSDNativeReader:
     """Bounded asynchronous reads; the native call releases the Python GIL.
 
@@ -553,6 +587,26 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         self._stat_read = 0.0
         self._stat_steps = 0
         self._stat_tokens = 0
+        self._trace = os.getenv("VLLM_PLE_SSD_TRACE", "0") == "1"
+        # Events are made once, eight per traced step, and read only when a
+        # window closes, so timing never costs a synchronization on the path
+        # being timed. Device marks pair up through torch's elapsed_time, which
+        # compares one device clock against itself rather than against the host.
+        self._trace_events: list[torch.cuda.Event] = []
+        self._trace_pool: list[_TraceSlot] = []
+        self._trace_active: list[_TraceSlot] = []
+        self._trace_index = 0
+        self._trace_slot: _TraceSlot | None = None
+        if self._trace:
+            self._trace_events = [
+                torch.cuda.Event(enable_timing=True)
+                for _ in range(TRACE_STEPS * TRACE_MARKS)
+            ]
+            self._trace_pool = [
+                _TraceSlot(self._trace_events[i * TRACE_MARKS : (i + 1) * TRACE_MARKS])
+                for i in range(TRACE_STEPS)
+            ]
+            logger.info("PLE SSD timeline tracing on, %d steps per window", TRACE_STEPS)
         self._loaded_starts: set[int] = set()
         logger.info(
             "PLE SSD: %.2f GiB on disk, %d I/O workers, %d MiB row cache",
@@ -580,6 +634,10 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         t0 = time.perf_counter()
         self._ids_ready.synchronize()
         self._stat_ids += time.perf_counter() - t0
+        slot = self._trace_slot
+        if slot is not None:
+            slot.h_ids = t0
+            slot.h_ids_end = time.perf_counter()
         t0 = time.perf_counter()
         self._table.read(
             self._ids[:tokens].numpy(),
@@ -589,13 +647,20 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
             .reshape(-1, self._table.row_bytes),
         )
         self._stat_read += time.perf_counter() - t0
+        if slot is not None:
+            slot.h_rows = time.perf_counter()
         self._stat_tokens += tokens
         self._copy_to_gpu(tokens)
 
     def _copy_to_gpu(self, tokens: int) -> None:
+        slot = self._trace_slot
+        if slot is not None:
+            slot.h_h2d = time.perf_counter()
         with torch.cuda.device(self._device), torch.cuda.stream(self._stream):
             self._gpu[:tokens].copy_(self._host[:tokens], non_blocking=True)
             self._copy_ready.record(self._stream)
+            if slot is not None:
+                slot.events[6].record(self._stream)
 
     @partial(eager_break_during_capture, always=True)
     def start_prefetch(self, hidden_states, ngram_ids) -> None:
@@ -613,15 +678,102 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
             # lookups start on replay, when those kernels have run.
             return
         # Host staging must outlive H2D; device staging must outlive its consumer.
+        slot: _TraceSlot | None = None
+        if self._trace:
+            slot = self._trace_pool[self._trace_index]
+            self._trace_index = (self._trace_index + 1) % TRACE_STEPS
+            slot.tokens = tokens
+            self._trace_active.append(slot)
+            self._trace_slot = slot
+            slot.h_gate = time.perf_counter()
         self._copy_ready.synchronize()
+        if slot is not None:
+            slot.h_gate_end = time.perf_counter()
         self._stream.wait_event(self._previous_use)
         # Preserve IDs before the next graph segment reuses their pool slot.
         self._device_ids[:tokens].copy_(ngram_ids)
+        if slot is not None:
+            slot.events[0].record(torch.cuda.current_stream())
         self._stream.wait_stream(torch.cuda.current_stream())
+        if slot is not None:
+            slot.events[1].record(self._stream)
+            slot.events[2].record(self._stream)
         with torch.cuda.stream(self._stream):
+            if slot is not None:
+                slot.events[3].record(self._stream)
             self._ids[:tokens].copy_(self._device_ids[:tokens], non_blocking=True)
             self._ids_ready.record(self._stream)
+            if slot is not None:
+                slot.events[4].record(self._stream)
+                slot.events[5].record(self._stream)
         self._pending = self._coordinator.submit(self._read_and_copy, tokens)
+
+    def _flush_trace(self) -> None:
+        """Report the traced window stratified by step shape, then free the slots.
+
+        Device intervals come from elapsed_time between event pairs, so they
+        compare one device clock against itself; host intervals come from one
+        monotonic host clock. The two are compared by totals rather than bridged,
+        because there is no cheap way to map a device clock onto a host clock.
+        """
+        if not self._trace_active:
+            return
+        torch.cuda.synchronize(self._device)
+        names = ("p->w", "w->j", "j->s", "copy", "s->e", "e->h", "h->c")
+        pairs = ((0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7))
+        groups: dict[int, list[_TraceSlot]] = {}
+        for slot in self._trace_active:
+            groups.setdefault(slot.tokens, []).append(slot)
+        for tokens in sorted(groups):
+            slots = groups[tokens]
+            device: dict[str, list[float]] = {name: [] for name in names}
+            device["chain"] = []
+            host: dict[str, list[float]] = {
+                "gate": [],
+                "ids": [],
+                "rows": [],
+                "pending": [],
+            }
+            for slot in slots:
+                events = slot.events
+                total = 0.0
+                for name, (a, b) in zip(names, pairs):
+                    value = events[a].elapsed_time(events[b])
+                    device[name].append(value)
+                    total += value
+                device["chain"].append(total)
+                host["gate"].append(slot.h_gate_end - slot.h_gate)
+                host["ids"].append(slot.h_ids_end - slot.h_ids)
+                host["rows"].append(slot.h_rows - slot.h_ids_end)
+                host["pending"].append(slot.h_pending_end - slot.h_pending)
+            parts = [
+                f"{name} {1e3 * _ms_percentile(device[name], 0.5):.2f}/"
+                f"{1e3 * _ms_percentile(device[name], 0.95):.2f}"
+                for name in names
+            ]
+            logger.info(
+                "PLE trace device (tokens=%d, n=%d, p50/p95 us): %s",
+                tokens,
+                len(slots),
+                ", ".join(parts),
+            )
+            logger.info(
+                "PLE trace chain (tokens=%d): p50 %.2f p95 %.2f us; host "
+                "gate %.2f/%.2f ids %.2f/%.2f rows %.2f/%.2f "
+                "pending %.2f/%.2f us",
+                tokens,
+                1e3 * _ms_percentile(device["chain"], 0.5),
+                1e3 * _ms_percentile(device["chain"], 0.95),
+                1e6 * _ms_percentile(host["gate"], 0.5),
+                1e6 * _ms_percentile(host["gate"], 0.95),
+                1e6 * _ms_percentile(host["ids"], 0.5),
+                1e6 * _ms_percentile(host["ids"], 0.95),
+                1e6 * _ms_percentile(host["rows"], 0.5),
+                1e6 * _ms_percentile(host["rows"], 0.95),
+                1e6 * _ms_percentile(host["pending"], 0.5),
+                1e6 * _ms_percentile(host["pending"], 0.95),
+            )
+        self._trace_active = []
 
     @partial(eager_break_during_capture, always=True)
     def _finalize_prefetch(self, output: torch.Tensor) -> None:
@@ -633,8 +785,16 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         t0 = time.perf_counter()
         self._pending.result()
         self._stat_wait += time.perf_counter() - t0
+        slot = self._trace_slot
+        if slot is not None:
+            slot.h_pending = t0
+            slot.h_pending_end = time.perf_counter()
+            slot.events[7].record(torch.cuda.current_stream())
         self._pending = None
+        self._trace_slot = None
         self._stat_steps += 1
+        if self._trace and self._stat_steps % TRACE_STEPS == 0:
+            self._flush_trace()
         if self._stats and self._stat_steps % 200 == 0:
             table = self._table
             logger.info(
