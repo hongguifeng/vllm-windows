@@ -117,6 +117,14 @@ def ple_ssd_weights_iterator(files, use_tqdm, strategy, local_expert_ids=None):
     )
 
 
+def _percentile(values: list[int], q: float) -> int:
+    """Nearest-rank percentile, used to describe per-lookup miss counts."""
+    if not values:
+        return 0
+    ordered = sorted(values)
+    return ordered[min(int(q * (len(ordered) - 1)), len(ordered) - 1)]
+
+
 class PLESSDNativeReader:
     """Bounded asynchronous reads; the native call releases the Python GIL.
 
@@ -237,6 +245,21 @@ class PLESSDTable:
         self.cache_limit = cache_mb * 1024 * 1024 // (self.row_bytes + 128)
         self.cache: OrderedDict[int, bytes] = OrderedDict()
         self.hits = self.reads = 0
+        # Window-scoped counters, cleared on every report so a logged percentage
+        # describes the window beside it instead of the whole process. Hits count
+        # distinct rows within a lookup; occurrences count rows as they are asked
+        # for, duplicates included, which is what a consumer actually waits on.
+        self.demanded_lookups = 0
+        self.demanded_hit_rows = 0
+        self.demanded_miss_rows = 0
+        self.demanded_hit_occ = 0
+        self.demanded_miss_occ = 0
+        self.demanded_rows = 0
+        self.demanded_all_hit = 0
+        self.demanded_miss_hist: list[int] = []
+        self.lookahead_lookups = 0
+        self.lookahead_hit_rows = 0
+        self.lookahead_miss_rows = 0
         self._condition = threading.Condition()
         self._reading = False
         self._waiting = 0
@@ -347,31 +370,51 @@ class PLESSDTable:
                 if not prefetch:
                     self._waiting -= 1
         try:
-            self._read(ids, output)
+            self._read(ids, output, prefetch)
         finally:
             with self._condition:
                 self._reading = False
                 self._condition.notify_all()
 
-    def _read(self, ids: np.ndarray, output: np.ndarray) -> None:
+    def _read(
+        self, ids: np.ndarray, output: np.ndarray, prefetch: bool
+    ) -> None:
         """Fill a byte buffer in request order, preserving duplicate rows."""
         flat = ids.reshape(-1)
         if output.shape != (flat.size, self.row_bytes) or output.dtype != np.uint8:
             raise ValueError("PLE SSD output must be uint8 [number of IDs, row bytes]")
-        unique = np.unique(flat).tolist()
-        if unique and (unique[0] < 0 or unique[-1] >= self.rows):
+        unique, counts = np.unique(flat, return_counts=True)
+        row_ids = unique.tolist()
+        if row_ids and (row_ids[0] < 0 or row_ids[-1] >= self.rows):
             raise IndexError("PLE row ID outside checkpoint table")
         found = {}
         missing = []
-        for row in unique:
+        hit_occ = miss_occ = 0
+        for row, count in zip(row_ids, counts.tolist()):
             cached = self.cache.get(row)
             if cached is None:
                 missing.append(row)
+                miss_occ += int(count)
             else:
                 found[row] = cached
                 self.cache.move_to_end(row)
+                hit_occ += int(count)
         self.hits += len(found)
         self.reads += len(missing)
+        if prefetch:
+            self.lookahead_lookups += 1
+            self.lookahead_hit_rows += len(found)
+            self.lookahead_miss_rows += len(missing)
+        else:
+            self.demanded_lookups += 1
+            self.demanded_hit_rows += len(found)
+            self.demanded_miss_rows += len(missing)
+            self.demanded_hit_occ += hit_occ
+            self.demanded_miss_occ += miss_occ
+            self.demanded_rows += flat.size
+            if not missing:
+                self.demanded_all_hit += 1
+            self.demanded_miss_hist.append(len(missing))
         if missing:
             # Keep only workers tasks queued, even for a large prefill.
             active_workers = min(self.workers, len(missing))
@@ -594,22 +637,48 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         self._stat_steps += 1
         if self._stats and self._stat_steps % 200 == 0:
             table = self._table
-            rows = table.hits + table.reads
             logger.info(
                 "PLE SSD stats over %d steps: wait %.2f ms/step, "
-                "row assembly %.2f ms/step, ids wait %.2f ms/step, "
-                "%d rows (%.1f%% from cache)",
+                "row assembly %.2f ms/step, ids wait %.2f ms/step",
                 self._stat_steps,
                 1e3 * self._stat_wait / self._stat_steps,
                 1e3 * self._stat_read / self._stat_steps,
                 1e3 * self._stat_ids / self._stat_steps,
-                rows,
-                100 * table.hits / rows if rows else 0.0,
+            )
+            rows = table.demanded_hit_rows + table.demanded_miss_rows
+            occ = table.demanded_hit_occ + table.demanded_miss_occ
+            lookups = table.demanded_lookups
+            logger.info(
+                "PLE decode window: %d lookups, %.1f rows per lookup, "
+                "%.1f%% unique hits, %.1f%% row hits, %.1f%% all-hit "
+                "lookups, miss p50/p95/p99 %d/%d/%d, "
+                "%d lookahead lookups",
+                lookups,
+                table.demanded_rows / lookups if lookups else 0.0,
+                100 * table.demanded_hit_rows / rows if rows else 0.0,
+                100 * table.demanded_hit_occ / occ if occ else 0.0,
+                100 * table.demanded_all_hit / lookups if lookups else 0.0,
+                _percentile(table.demanded_miss_hist, 0.5),
+                _percentile(table.demanded_miss_hist, 0.95),
+                _percentile(table.demanded_miss_hist, 0.99),
+                table.lookahead_lookups,
             )
             self._stat_wait = 0.0
             self._stat_read = 0.0
             self._stat_ids = 0.0
             self._stat_steps = 0
+            table.hits = table.reads = 0
+            table.demanded_lookups = 0
+            table.demanded_hit_rows = 0
+            table.demanded_miss_rows = 0
+            table.demanded_hit_occ = 0
+            table.demanded_miss_occ = 0
+            table.demanded_rows = 0
+            table.demanded_all_hit = 0
+            table.demanded_miss_hist = []
+            table.lookahead_lookups = 0
+            table.lookahead_hit_rows = 0
+            table.lookahead_miss_rows = 0
         torch.cuda.current_stream().wait_event(self._copy_ready)
         output.copy_(self._gpu[: output.shape[0]].flatten(-2))
         self._previous_use.record()
