@@ -7,6 +7,7 @@ from typing import Literal
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -22,6 +23,22 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+
+def _is_spec_prefix_mask(mask: torch.Tensor, count: int) -> bool:
+    """Return True when the true rows of ``mask`` are exactly its first rows.
+
+    Indexing a device tensor with a host boolean mask becomes masked_select, which
+    has to synchronize the device to size its output. When the selected rows are a
+    prefix, a slice returns identical values without that synchronization, so this
+    check gates the fast path. A mask with a hole in the middle must take the slow
+    path.
+    """
+    if mask.dtype != torch.bool or not 0 <= count <= mask.numel():
+        return False
+    if count == mask.numel():
+        return bool(mask.all())
+    return bool(mask[:count].all()) and not bool(mask[count:].any())
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -219,6 +236,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        prefix_fast = False
         block_table_tensor = mamba_get_block_table_tensor(
             m.block_table_tensor,
             m.seq_lens,
@@ -244,6 +262,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             else:
                 spec_sequence_masks = async_tensor_h2d(
                     spec_sequence_masks_cpu, device=query_start_loc.device
+                )
+                prefix_fast = envs.VLLM_GDN_SPEC_PREFIX_FAST and _is_spec_prefix_mask(
+                    spec_sequence_masks_cpu, num_spec_decodes
                 )
 
         if spec_sequence_masks is None:
@@ -302,10 +323,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_token_indx = torch.empty(
                     0, dtype=torch.int32, device=query_start_loc.device
                 )
-                # Filter by spec_sequence_masks to exclude padded sequences
-                spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
-                ]
+                # Filter by spec_sequence_masks to exclude padded sequences. When
+                # every request is a spec decode the mask is a prefix, and slicing
+                # avoids the device synchronization masked_select would force.
+                if prefix_fast:
+                    spec_state_indices_tensor = block_table_tensor[
+                        :num_spec_decodes, : self.num_spec + 1
+                    ].contiguous()
+                else:
+                    # Filter by spec_sequence_masks to exclude padded sequences
+                    spec_state_indices_tensor = block_table_tensor[
+                        spec_sequence_masks_cpu, : self.num_spec + 1
+                    ]
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
                 # num_spec_decodes + 1 entries of query_start_loc already
@@ -362,7 +391,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            if prefix_fast:
+                num_accepted_tokens = num_accepted_tokens[
+                    :num_spec_decodes
+                ].contiguous()
+            else:
+                num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None

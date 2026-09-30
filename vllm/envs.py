@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     # Build the mamba "align" block table with one Triton kernel instead of the
     # six-aten-op path. Saves ~82 us per call at decode batch sizes.
     VLLM_MAMBA_ALIGN_FUSED: bool = False
+    VLLM_GDN_SPEC_PREFIX_FAST: bool = False
     # Log per-step wall-time split (submit / wait for model output / output
     # bookkeeping / gap between steps) every 200 steps.
     VLLM_STEP_STATS: bool = False
@@ -785,6 +786,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MAMBA_ALIGN_FUSED": lambda: (
         os.environ.get("VLLM_MAMBA_ALIGN_FUSED", "0") == "1"
+    ),
+    "VLLM_GDN_SPEC_PREFIX_FAST": lambda: (
+        os.environ.get("VLLM_GDN_SPEC_PREFIX_FAST", "0") == "1"
     ),
     "VLLM_STEP_STATS": lambda: (
         os.environ.get("VLLM_STEP_STATS", "0") == "1"
