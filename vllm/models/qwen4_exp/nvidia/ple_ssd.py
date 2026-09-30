@@ -166,6 +166,7 @@ class _TraceSlot:
         "events",
         "prefix",
         "h_ids_seen",
+        "h_ids_pre_true",
         "h_ids_polls",
         "h_gate",
         "h_gate_end",
@@ -665,6 +666,8 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
     def _read_and_copy(self, tokens: int) -> None:
         t0 = time.perf_counter()
         polls = 0
+        slot = self._trace_slot
+        pre_true = 1 if self._ids_ready.query() else 0
         if self._ids_poll:
             while not self._ids_ready.query():
                 polls += 1
@@ -672,11 +675,11 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         else:
             self._ids_ready.synchronize()
         self._stat_ids += time.perf_counter() - t0
-        slot = self._trace_slot
         if slot is not None:
             slot.h_ids = t0
             slot.h_ids_end = time.perf_counter()
             slot.h_ids_polls = polls
+            slot.h_ids_pre_true = pre_true
         t0 = time.perf_counter()
         self._table.read(
             self._ids[:tokens].numpy(),
@@ -818,8 +821,8 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
             )
             logger.info(
                 "PLE trace ids (tokens=%d): wait p50 %.2f p95 %.2f us, "
-                "polls p50 %.1f, us per poll %.2f, seen true by main thread "
-                "in %d of %d steps",
+                "polls p50 %.1f, us per poll %.2f, ready before waiting in "
+                "%d of %d steps, seen true by main thread in %d of %d steps",
                 tokens,
                 1e6 * _ms_percentile(host["ids"], 0.5),
                 1e6 * _ms_percentile(host["ids"], 0.95),
@@ -827,6 +830,8 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
                 1e6
                 * _ms_percentile(host["ids"], 0.5)
                 / max(_percentile([s.h_ids_polls for s in slots], 0.5), 1.0),
+                sum(1 for s in slots if s.h_ids_pre_true > 0.0),
+                len(slots),
                 sum(1 for s in slots if s.h_ids_seen > 0.0),
                 len(slots),
             )
