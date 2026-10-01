@@ -1,0 +1,272 @@
+# Qwen3.8-Flash-Next 迁移到本仓库（Windows / CMP 170HX）可行性
+
+调研日期：2026-09-27。参考实现：WSL 里的 `/home/hong/code/qwen3.8-flash-next-cmp170hx/`，
+当前正跑在 docker 容器 `hong-pc`（镜像 `18gogogo/170hx1-qwen38nextf:sm80`，端口 9393→8000）里，
+占用 GPU0 的 62.1 GiB。GPU1 空闲。
+
+## 1. 模型与 WSL 侧基线
+
+| 项目 | 值 |
+|---|---|
+| 架构 | `Qwen4ExpForConditionalGeneration`（`vllm/models/qwen4_exp`，本仓库已注册） |
+| 层构成 | 48 层 = 36 `linear_attention`(GDN) + 12 `qwen_sparse_attention`(QSA)；MTP 1 层 `full_attention` |
+| head_dim | 256（和 27B 同）；`hc_count=4` 超连接；`indexer_budget=2048` |
+| PLE | 只有 1 层（layer id 2），`ngram_size=3`，`heads_per_ngram=8` → 16 头 × 20M 行 = 3.2 亿行，每行 160×bf16 = 320 B = **95.37 GiB**，独占 `model-00001-of-00011.safetensors` |
+| 权重总量 | 143 GiB（13 个 shard：11 主 + 2 MTP），其中 GPU 常驻 **47.32 GiB**（容器实测） |
+| CUDA graph | 捕获 28 s，占 **2.37 GiB**；`FULL_AND_PIECEWISE` + breakable graph |
+| 起服耗时 | 加载 130 s + 图 28 s，整体 8–10 min |
+| 量化 | `auto-round` 3bpw → vLLM 侧走 `inc`（`quant_method=inc`），MoE 是 `RoutedExperts` + 混合位宽 per-expert 覆盖 |
+| 参考性能 | **pass2 / 参考机**（不是本机：15 GiB RAM + 31 GiB swap，企业级 SATA SSD）：**MTP=1**，c1 解码 110.99、c16 聚合 667.13、8K prefill 2,636。**pass3 / 本机 WSL2 原生**：**MTP=2**，c1 解码 **131.19**、c4 聚合 **305.42**、c8 304.07。两个参考的 MTP 深度不同，不能直接互比。Windows 原生已复测 MTP×2：在我们这套单流流量上 c1 **144.0** tok/s（接受长度 2.73、接受率 86%，每步成本跟他们 MTP×2 齐平），见 ROUTE_A §17；他们的 131.19 是他们负载下的数，不是靶子。**同日重测深度阶梯（ROUTE_A §19）**：×2 中位 **149.5**（三块 144.4/149.5/152.2，±5%）、×3 **155.8**、×4 **175.7**（对 ×2 **+17.5%**，零代码改动），深度 5 起服即被 QSA 布局断言挡死；GPU 占用始终 ~40%，步时被 CPU 提交路径当限速。
+
+结论：**95.37 GiB 的 PLE 表不可能进显存，也不可能进 pinned host memory**。本机装了 88 GiB 物理内存
+（`Win32_PhysicalMemory` 求和），Windows 空闲 48.2 GiB、commit 上限 239.9 GiB / 空闲 128.0 GiB；
+95.37 GiB 直接大于总内存，而本项目已经因为 commit 逼近 130 GB 出过 BSoD。
+所以 WSL 侧用 SSD 后端，本仓库也必须用 SSD 后端 —— 上游那条 `EngramConfig(cpu_offload=True)` 的
+pinned-host + UVA 路线在本机不可用。
+
+## 2. 三个硬阻塞（按严重程度）
+
+### 2.1 当前构建的树根本没有 host/SSD 路线
+`HEAD = v0.29.0`：
+- `vllm/models/qwen4_exp/nvidia/ple_layer.py`（1256 行）里 `Qwen4ExpNGramEmbedding` 是 **GPU 常驻**的，
+  文件头注释直接写着 "GPU-resident"；只有 FP8-on-device 一种方法。
+- 没有 `ngram_embedding.py`，没有 `vllm/config/engram.py`，全仓库 `grep Engram` 零命中。
+- 把补丁打在工作树上逐文件失败（`git apply --check`）：`test_ple.py`、`test_auto_round.py`、
+  `breakable_cudagraph.py`、`mtp.py` 等都 does not apply —— v0.29.0→a5a30471f 之间 PLE 被拆分重构过。
+
+也就是说：**要在 Windows 上跑这个模型，先把树升到带 Engram/ngram_embedding 的版本，或者把这套
+host-offload 语义手工后移到 v0.29.0。** 后者约等于重写上游一个 feature，不划算。
+
+### 2.2 补丁能干净落到 `origin/main`，但那条分支没有 Windows 适配
+证据（已做过，不是推测）：
+
+```
+git worktree add --detach D:\code\vllm-flashtest origin/main   # 128 MB
+cd D:\code\vllm-flashtest && git apply --check -v .../qwen38-ple-ssd.patch
+→ 13 个文件全部 Checking 通过，零 error
+```
+
+而 `merge-base(origin/main, a5a30471f) = 71fc70d3ae`，那 23 个上游 commit **一个都没碰**补丁涉及的
+8 个文件 —— 所以干净是必然的，不是运气。
+
+问题是 `origin/main` 是"跟 upstream main"的那条线（`Merge branch 'vllm-project:main' into main` ×8 +
+几个 README），它的 `requirements/cuda.txt` 没有任何 win32 分支：`torch==2.13.0`、`torchvision==0.28.0`、
+`flashinfer-python==0.6.18.post1`、`tilelang==0.1.12`、`humming-kernels[cu13]==0.1.12`、
+`nvidia-cutlass-dsl[cu13]==4.6.2`、`quack-kernels==0.6.4`、`instanttensor>=0.1.9`。
+本仓库能跑的那条 `vllm-for-windows` 分支自己维护了一整套 win32 替身：
+`torch 2.11.0+cu130`、`torchvision 0.26.0+cu130`、`SystemPanic/flashinfer-windows 0.6.11.post3`、
+`tilelang 0.1.10`、`SystemPanic/humming-windows 0.1.15`、`cudnn-frontend <1.19`。
+
+好消息：`torch-2.13.0+cu130-cp312-win_amd64.whl` 在 download.pytorch.org 的 cu130 索引里**确实存在**
+（2.10/2.11/2.12/2.12.1/2.13/2.14 都有）。坏消息：flashinfer 0.6.18 / humming 0.1.12 / cutlass-dsl 4.6
+这几样在 Windows 上没有对应端口，而 `indexer_qsa.py`（QSA 稀疏注意力）是依赖 flashinfer 的。
+所以升到 `origin/main` 的真实成本不在打补丁，而在**依赖重新移植 + 全量重编（37 min）+ 把本轮之前那
+1937 行 27B 优化后移**。
+
+### 2.3 PLE 的 I/O 层是 Linux-only，而且本机把 Windows 的等价物也封掉了
+`_dev/probe/_ple_winio_probe.py` 实测（今天跑过）：
+
+```
+os.pread          ABSENT    os.posix_fadvise  ABSENT
+os.O_DIRECT       ABSENT    /proc/self/fd/3   ABSENT
+```
+
+这四项都能在 Python 侧用 seek+read / 不做 fadvise / 直接按路径 open 顶替 —— 代码里本来就有
+`ple_ssd_workers` 的线程池 fallback，只差一个 `pread` 替身。
+
+真正的问题在**绕过文件缓存**这一层。`ple_ssd_io.c` 靠 O_DIRECT 把每行扩成 4 KiB 对齐页读，
+Windows 的等价物是 `FILE_FLAG_NO_BUFFERING`，本机**在所有盘、所有文件上一律失败**：
+
+| 目标 | 结果 |
+|---|---|
+| D:\ 上的 27B safetensors | `ReadFile` → `ERROR_INVALID_PARAMETER (87)`，4096B@0 / 512B@0 / 4096B@4096 全失败 |
+| D:\ 上新建的 probe.bin | 同上 87 |
+| C:\ 上新建的 probe.bin | 同上 87 |
+| `C:\Windows\System32\drivers\etc\hosts` | 同上 87 |
+| 同一文件不带 NO_BUFFERING | `ok=1 got=4096`，正常 |
+| IOCP + `FILE_FLAG_OVERLAPPED` 提交 | 先成功约 60 个，随后 `ERROR_INVALID_HANDLE (6)` |
+
+对齐本身没做错（offset/size 都是 4096 的倍数，缓冲区来自 `VirtualAlloc`，64 KiB 粒度对齐），
+同一段代码换掉 NO_BUFFERING 就能读 —— 所以这是环境级的拦截，不是用法错误。最可疑的是
+**火绒**（`HipsDaemon` + `ahflt.sys`，分组 `FSFilter Activity Monitor`）在文件栈里；
+Defender 实时防护是关的，但 `WdFilter` 仍是 boot-start。`fltmc` 需要管理员权限，没跑成，
+所以"哪个 minifilter 干的"目前只是推断，不是结论。
+
+后果：Windows 版只能走 **buffered** 线程读，靠系统文件缓存。实测缓存命中的随机读：
+
+```
+threads  1: 165,548 rows/s  697 MiB/s  p50 0.00 ms p90 0.01 ms p99 0.02 ms
+threads  8: 142,048 rows/s  598 MiB/s  p50 0.04 ms p90 0.13 ms p99 0.27 ms
+threads 32: 137,845 rows/s  580 MiB/s  p50 0.20 ms p90 0.54 ms p99 1.16 ms
+```
+
+注意这组数字是 **3 GiB 热文件的页缓存命中**，不是设备速度。95 GiB 的表配 64 GiB 内存，命中率
+大概 2/3 封顶，冷的部分要付设备延迟 —— **这个还没测**，它是决定"值不值得迁"的关键数字。
+
+### 2.4 反过来说，这块盘已经被证明能扛住这个负载
+WSL 里的 `/` 是 `/dev/sdd` 1007 GiB（用 803 GiB），而 `D:\wsl\ext4.vhdx`（834 GiB 实占 / 896 GiB 稀疏）
+就在**同一块 EXCERIA G2** 上。也就是说 pass3 那组 **131 tok/s / 305 tok/s**（本机、WSL2 原生、
+PLE 走 `O_DIRECT`+AIO）是穿过 `ext4 → vhdx → NTFS → NVMe` 这么一层更深的栈跑出来的。原生 Windows
+buffered 读只少掉 vhdx 这一层，不可能更差。**盘不是阻塞点**，剩下的风险全在软件侧。
+（注意：pass2 的 110.99 / 667.13 是**参考机 + SATA SSD** 上测的，不能拿来为本机的盘背书。）
+
+`_dev/probe/_ple_coldread_probe.py` 的冷读实测（先写一个 100 GiB 的 `FILE_FLAG_WRITE_THROUGH` 文件，
+让它根本不进文件缓存，再随机读）：
+
+```
+4096 B 随机读 threads 1 :  13,392 reads/s   p50 0.063 ms  p90 0.081 ms  p99 0.115 ms
+```
+
+这一行是全场唯一可信的"冷"数字：63 µs 正是 NVMe 单队列随机读的延迟，13.4k IOPS 也对得上。
+后面 4/8/16/32 线程冲到 15–16 万 reads/s、p50 掉到 7–20 µs，那是 Windows 缓存管理器把读扩展成大
+extent 后命中了自己的 standby list —— **同一个文件被同一个脚本反复读，第二轮起就不是冷读**；
+320 B 那一组（p50 3 µs）整组都被上一轮 4096 B 的读预热过，只能当污染样本看。要把并发测准，
+得每个配置前重新 `--make` 一次（冷文件靠重写，不靠重读），一次 115 s。
+
+即便如此结论已经够用：QD1 冷读 ~13k IOPS / 63 µs；解码每步最多 `batch×16` 行（c16 = 256 行），
+一个 2048-token prefill 块 `2048×16 = 32,768` 行 ≈ 2,560 个 4 KiB 页 ≈ 10 MiB 设备工作量；
+16 个读线程 + 补丁自带的 512 MiB 行缓存（≈110 万行）足以把它压到毫秒级。
+
+## 3. 其它会踩到的点
+
+- **容量**：64 GiB 卡上 47.32 GiB 权重 + 2.37 GiB 图 + 视觉塔，`--gpu-memory-utilization 0.96` 要 61.4 GiB。
+  本项目的实测经验是 WDDM 还有约 1.4 GiB 驱动保留 + 3 GiB 不敢碰的顶部区域，
+  真实可用约 60 GiB → KV 只剩 8–10 GiB，262,144 上下文多半保不住。
+  `start_server.ps1` 那套 fit 公式是按 27B 的 ~78 KB/token 标定的，这个混合模型要重新标定。
+- **TP=2 不是出路**：本 rig 上从没跑过 NCCL；而且 `Qwen4ExpPLESSDEmbedding.__init__` 明确拒绝
+  `TP!=1 or DP!=1`。
+- **GPU0 被 WSL 容器占着**（62.1 GiB）。Windows 侧只能上 GPU1，或者先把容器停掉。
+- **数据**：143 GiB 模型现在只在 WSL ext4（`/dev/sdd`）里。`dd` 实测 WSL→`/mnt/d` 稳定 **231 MB/s**
+  → 全程约 11 min，可行。但 `D:\wsl\ext4.vhdx` 和模型目标目录在同一块 NVMe 上，拷贝会和正在跑的
+  WSL 服务抢盘 —— 那个服务恰好是 SSD-delivery-bound（8K prefill 有 36% 时间在等 PLE）。
+  D: 现在剩 480 GiB，放完模型剩约 337 GiB，还要给 vhdx 留增长空间。
+  WSL 侧只看得到 62 GiB 内存 / 16 GiB swap，页缓存装不下这张表，那边才要靠 O_DIRECT + 应用层行缓存。
+- **spec decode 不一样**：WSL 用 MTP=1；本仓库的收益来自 DFlash2，而 Flash-Next 没有 DFlash2 drafter。
+  MTP 路径依赖补丁里"checkpoint 层 0 量化项重映射到运行时层 48"。
+- **可能能沿用的本地优化**：head_dim=256 → `prefill_attn_hd256.py` 相关；int8 Marlin 激活；
+  GDN 的 FLA/mamba 补丁。但它们全是照 v0.29.0 的布局写的，换树就得重新对一遍。
+- **没验证过的部分**：QSA 稀疏注意力、`hc_count=4` 超连接、INC 的 2/3bit `RoutedExperts` MoE 在
+  sm_80 + Windows 上到底跑不跑得起来（`low_latency_gemm.py` 明确 gate 在 `(10,3)` 能力上，sm_80 走不到它）。
+
+## 4. 建议的推进顺序（先花小钱证伪）
+
+1. **先测冷盘随机读** —— 已测，见 §2.4：QD1 冷读 13k IOPS / p50 63 µs，而且这块盘正在跑同一个负载
+   （WSL 容器）。一票否决的风险已经排除；还缺的是**并发**冷读数，办法是每个配置前重建冷文件。
+2. **确认模型能不能进 Windows**：已完成。143 GiB 已落在
+   `D:\models\Qwen3.8-Flash-Next-AutoRound-3bpw-MTP`（元数据 sha256 全 MATCH，PLE shard 头尾 1 GiB
+   MATCH，header offset 与数据区严格相等；校验见 `_dev/probe/_copy_verify.sh`）。
+   结构烟测**已经跑过，结论见 §6**：现有构建连层都构造不出来（QSA 在 fork 树里不存在），
+   所以这一条的答案是“否”，且原因不是 Windows。
+3. 第 2 条的“便宜证伪”已经付过钱了，而且它否掉的是另一件事：烟测证明**路线 A 是前提而不是选项**。
+   §7 用实测把这笔大钱拆成了可数的 16 个冲突文件。
+   落地点：`git worktree add D:\code\vllm-flashtest origin/main` → `git apply qwen38-ple-ssd.patch`
+   → 把 win32 依赖分支和 build 修复 forward-port 过去 → 再把 `ple_ssd.py` 的 reader 换成
+   Windows buffered 线程实现（Linux AIO 那条 `_native` 路径直接不要）。
+4. 起服参数按 60 GiB 可用重算：`--gpu-memory-utilization`、`--max-model-len`、graph capture 上限都要
+   重标，不能照抄 WSL 的 0.96 / 262144。
+
+## 5. 本轮留下的工件
+
+- 分支 `wip/qwen38-flash-next`：两个 commit，`e0cdee4a68`（27B 优化，40 文件 / +1937）和
+  `62c004312d`（`_dev` 脚手架，232 文件）。tag `pre-flash-next-20260927` → `62c004312d`。
+  **两个 commit 都不含本轮新建的文件**；本轮的 `_dev/probe/_ple_winio_probe.py` 和
+  `_dev/out/wsl_flash_next/` 保持未跟踪，`git status` 里能看到。
+- `_dev/probe/_ple_coldread_probe.py`：造冷文件（write-through）+ buffered 随机读的 IOPS/延迟。
+  ⚠ 同一个文件重复测第二轮就不冷了，要换新文件才有冷读意义。
+- `_dev/probe/_ple_winio_probe.py`：Linux-only 调用清单 + 页扩展取行的正确性对比 +
+  同步多线程/IOCP 两种读法的 IOPS 与延迟。重跑：
+  `D:\code\vllm-windows\.venv\Scripts\python.exe D:\code\vllm-windows\_dev\probe\_ple_winio_probe.py`
+  （`--file` 指到大于内存的文件即可测冷盘）。
+- `_dev/out/wsl_flash_next/`：从容器里取出的 `ple_ssd.py` / `ple_ssd_io.c` / `ngram_embedding.py` /
+  `model_state.py` / `mtp.py`，以及 `qwen38-ple-ssd.patch` 的本地副本。
+- `D:\code\vllm-flashtest`：`origin/main` 的临时 worktree（128 MB），补丁在此干净通过，
+  是第 4 节的落地位置。不需要时 `git worktree remove D:\code\vllm-flashtest`。
+- `_dev/probe/_flashnext_trim.py`：造“PLE-free 视图”（hardlink + 改 `index.json` /
+  `ple_layer_ids: []`），输出到 `D:\models\Qwen3.8-Flash-Next-struct`。
+- `_dev/bin/_flashnext_struct_serve.ps1`：烟测专用的起服脚本（GPU1 / eager / `--language-model-only`，
+  `-DryRun`、`-Graphs`、`-WithVision`、`-Mtp` 四个开关）。日志到 `_dev/out/logs/flashnext_*.log`。
+- `_dev/test/_flashnext_smoke.py`：`/health` 轮询 + 短/长 prefill + 两路并发。
+- `_dev/probe/_copy_verify.sh`：拷贝完整性（元数据 sha256、所有 shard 尺寸、PLE shard 头尾 1 GiB）。
+  从 WSL 跑：`wsl.exe -d Ubuntu -- bash /mnt/d/code/vllm-windows/_dev/probe/_copy_verify.sh`
+  （git-bash 下记得 `MSYS_NO_PATHCONV=1`）。
+- `_dev/out/wsl_flash_next/probe_inc_moe.patch`：给 site-packages 打的 probe-only 两处 hunk，
+  原件在 `_dev/out/installed_backups/inc/`。回滚：
+  `Copy-Item _dev\out\installed_backups\inc\config_parser.py.orig <site-packages>\inc\config_parser.py -Force`
+  （ schemes 同理）。不设 `VLLM_PROBE_INC_HUMMING_LOWBIT` 时这些 hunk 不生效。
+- `_dev/out/wsl_flash_next/winfixes/*.patch`：fork 的 5 个 Windows commit 的 `format-patch` 副本，
+  §7 的计数就是从这里测出来的。
+- `_dev/out/wsl_flash_next/container_{quant_humming,inc,inc_wna16_scheme,factory}.py`：容器
+  `a5a30471f` 的 INC/humming 参考件（注意 `container_humming.py` 其实是 `vllm/utils/humming.py`）。
+
+## 6. 结构烟测的实测结果（2026-09-27 19:39 – 19:51）
+
+拷贝与视图：
+- phase1（除 PLE shard 外的 47.6 GiB）rc=0 @19:38:45，phase2（95.37 GiB PLE shard）rc=0 @19:51:56，
+  实测 ~160 MB/s（比 `dd` 的 231 MB/s 低，因为容器正在同一块 NVMe 上服务同一个模型）。
+- `D:\models\Qwen3.8-Flash-Next-struct`：`_dev/probe/_flashnext_trim.py` 造的“PLE-free 视图”
+  （hardlink 34 个文件、`index.json` 去掉 128 个 PLE key、`config.json` 里 `ple_layer_ids: []`）。
+
+第一次 19:39（GPU1，enforce-eager，`--language-model-only`，4096 ctx）：
+
+```
+ValueError: MoeWNA16Method only supports int4 and int8 now.
+```
+
+这不是 Windows 的问题，是 INC 的两处缺口：
+1. `inc/config_parser.py` 只把类名里含 `fusedmoe` 的层当 MoE，而 qwen4_exp 用
+   `FusedMoEFactory` → `RoutedExperts`，类名里没有 `fusedmoe` → 专家的 per-layer config 挂不上 →
+   `get_moe_method` 落到 `MoeWNA16Method`（只认 int4/int8）→ 抛错。补丁里带这个 hunk。
+2. `origin/main`（和容器的基线 `a5a30471f`）的 `inc/schemes/inc_wna16_scheme.py` 有
+   `CUDA_HUMMING_SUPPORTED_BITS = {2, 3, 5, 6, 7}`，CUDA 上的 2/3-bit 直接走 humming；
+   fork（`13e844c86d`）完全没有这段路由，只能掉进 `_resolve_gptq_moe`。
+
+为了把验证成本压到近零，我给 site-packages 打了 probe-only 的这两处 hunk
+（`_dev/out/wsl_flash_next/probe_inc_moe.patch`，原件备份在 `_dev/out/installed_backups/`），
+并且全部 gate 在 `VLLM_PROBE_INC_HUMMING_LOWBIT=1` —— 不设这个变量时 27B 的解析路径一字不变。
+
+第二次 19:49：
+
+```
+INFO [fused_humming_moe.py:118] Using indexed gemm for humming moe
+INFO [humming_utils.py:744]    Using HummingIndexedExperts Humming MoE backend.
+ERROR ValueError: Invalid layer_type qwen_sparse_attention
+```
+
+- Windows 侧 `humming 0.1.15`（SystemPanic 的 Windows 端口）**能把 2/3-bit MoE 的 method 建起来**
+  （容器里是 upstream `humming 0.1.12`）；kernel 真跑起来与否仍未证。
+- 然后死在第 3 层：`git grep qwen_sparse_attention 13e844c86d` → **0 处**，`origin/main` 里有。
+  fork 的 `vllm/models/qwen4_exp/` 与 `origin/main` 相差 23 文件 / +3489 −1758，`origin/main` 还多出
+  `ngram_embedding.py`、`ops/ple.py`、`ops/qsa_indexer.py`。48 层里 12 层的 QSA 在现有构建上
+  根本构造不出来 → **路线 A 是前提，不是选项**。
+- 烟测只证明了 layer 0–2（`linear_attention` + MoE）能构造；GDN 全 36 层、QSA、hc_count=4 的
+  前向、CUDA graph、marlin 2-bit 全部仍未验证。
+- “用 `--load-format dummy` 更便宜地试结构”这条路也否掉了：专家参数 ≈ 512 × 3 × 640 × 2560 × 48
+  ≈ 120 B，bf16 dummy 权重 ≈ 240 GiB，64 GiB 的卡放不下。
+
+## 7. 路线 A 的工作量（实测计数，不是估计）
+
+把 fork 的 5 个 Windows commit（`3d3a44e4a8`、`b137929e44`、`160f6b2b76`、`4eebec3745`、
+`13e844c86d`）逐文件 `git apply --check` 到 `origin/main + qwen38-ple-ssd.patch` 上：
+**65 个文件干净通过，16 个文件冲突**。要手工的 16 个：
+
+| 文件 | 来自 | 性质 |
+|---|---|---|
+| `requirements/cuda.txt` | 3 个 commit 都撞 | win32 依赖 pin，最需要想清楚的一处 |
+| `requirements/common.txt` | 3d3a44e4a8 | 同上 |
+| `CMakeLists.txt` | 3d3a44e4a8 | MSVC/build 开关 |
+| `cmake/external_projects/deepgemm.cmake` | 3d3a44e4a8 | 外部项目开关 |
+| `cmake/external_projects/flashkda.cmake` | 13e844c86d | 同上 |
+| `README.md` | 3d3a44e4a8 | 文档噪声 |
+| `csrc/fs_io.cpp` | 4eebec3745 | win32 文件 I/O |
+| `csrc/libtorch_stable/moe/marlin_moe_wna16/ops.cu` | 3d3a44e4a8 | Windows 编译修复 |
+| `csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu` | 3d3a44e4a8 | 同上 |
+| `csrc/libtorch_stable/quantization/marlin/marlin.cu` | 3d3a44e4a8 | 同上 |
+| `csrc/libtorch_stable/activation_kernels.cu` | 13e844c86d | 同上 |
+| `vllm/distributed/device_communicators/shm_broadcast.py` | 13e844c86d | win32 共享内存/信号 |
+| `vllm/entrypoints/cli/serve.py` | 3d3a44e4a8 | 入口噪声，好解 |
+| `vllm/entrypoints/grpc_server.py` | 3d3a44e4a8 | 同上 |
+| `vllm/model_executor/warmup/kernel_warmup.py` | 4eebec3745 | win32 warmup |
+| `vllm/v1/attention/backends/flashinfer.py` | 13e844c86d | flashinfer-windows 适配 |
+
+模型代码（qwen4_exp / GDN / QSA / PLE / MTP）不需要移植 —— 它们本来就在 `origin/main` 里，
+升级是把它们**拿过来**，真正要搬的只有上面这 16 处 win32 适配。
