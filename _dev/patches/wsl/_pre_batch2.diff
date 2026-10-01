@@ -1,0 +1,592 @@
+diff --git a/vllm/entrypoints/launchers/api_server/entry.py b/vllm/entrypoints/launchers/api_server/entry.py
+index 9e4ba3d630..edf32d5045 100644
+--- a/vllm/entrypoints/launchers/api_server/entry.py
++++ b/vllm/entrypoints/launchers/api_server/entry.py
+@@ -202,7 +202,6 @@ async def run_server_worker(
+ 
+ 
+ def main():
+-    import uvloop
+     import platform
+     if platform.system() == "Windows":
+         import winloop as uvloop_impl
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 1a49206316..68bb1b90ad 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -615,6 +615,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         return TokenizeParams(
+             max_total_tokens=model_config.max_model_len,
+             max_output_tokens=max_output_tokens or 0,
++            reserve_output_tokens=False,
+             truncate_prompt_tokens=self.truncate_prompt_tokens,
+             truncation_side=self.truncation_side,
+             add_special_tokens=self.add_special_tokens,
+diff --git a/vllm/entrypoints/openai/completion/protocol.py b/vllm/entrypoints/openai/completion/protocol.py
+index 4edef74ea7..4f8ebcc460 100644
+--- a/vllm/entrypoints/openai/completion/protocol.py
++++ b/vllm/entrypoints/openai/completion/protocol.py
+@@ -264,6 +264,7 @@ class CompletionRequest(OpenAIBaseModel):
+         return TokenizeParams(
+             max_total_tokens=model_config.max_model_len,
+             max_output_tokens=self.max_tokens or 0,
++            reserve_output_tokens=False,
+             truncate_prompt_tokens=self.truncate_prompt_tokens,
+             truncation_side=self.truncation_side,
+             add_special_tokens=self.add_special_tokens,
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+index 0363c01de3..78dfd992e2 100644
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -355,6 +355,7 @@ class ResponsesRequest(OpenAIBaseModel):
+         return TokenizeParams(
+             max_total_tokens=model_config.max_model_len,
+             max_output_tokens=self.max_output_tokens or 0,
++            reserve_output_tokens=False,
+             truncate_prompt_tokens=-1 if self.truncation != "disabled" else None,
+             max_total_tokens_param="max_model_len",
+             max_output_tokens_param="max_output_tokens",
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 8a69165447..1aa542fad4 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -28,6 +28,7 @@ if TYPE_CHECKING:
+     CUDA_VISIBLE_DEVICES: str | None = None
+     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
+     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
++    VLLM_ENGINE_STALL_SENTINEL_S: float = 0.0
+     VLLM_API_KEY: str | None = None
+     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
+     S3_ACCESS_KEY_ID: str | None = None
+@@ -187,6 +188,10 @@ if TYPE_CHECKING:
+     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
+     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
+     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
++    VLLM_MARLIN_INT8_INCLUDE_RE: str = ""
++    VLLM_MARLIN_INT8_EXCLUDE_RE: str = "lm_head|mtp"
++    # syv patch (marlin-repack-staged-sm80): "1"/"0" override of the staging buffer, unset = on for sm80 only
++    VLLM_MARLIN_REPACK_STAGED: str | None = None
+     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
+     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
+     VLLM_HUMMING_USE_F16_ACCUM: bool = False
+@@ -794,6 +799,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_ENGINE_ITERATION_TIMEOUT_S": lambda: int(
+         os.environ.get("VLLM_ENGINE_ITERATION_TIMEOUT_S", "60")
+     ),
++    # Warn when the engine core stops completing steps while requests are
++    # still alive, after this many seconds. 0 (default) disables the check.
++    "VLLM_ENGINE_STALL_SENTINEL_S": lambda: float(
++        os.environ.get("VLLM_ENGINE_STALL_SENTINEL_S", "0")
++    ),
+     # Timeout in seconds for waiting for engine cores to become ready
+     # during startup. Default is 600 seconds (10 minutes).
+     "VLLM_ENGINE_READY_TIMEOUT_S": lambda: int(
+@@ -1505,6 +1515,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
+         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+     ),
++    # syv patch: per-layer regex selection for the Marlin int8/fp8 activation
++    # path (registered here so they take part in the torch.compile cache key)
++    "VLLM_MARLIN_INT8_INCLUDE_RE": lambda: os.environ.get(
++        "VLLM_MARLIN_INT8_INCLUDE_RE", ""
++    ),
++    "VLLM_MARLIN_INT8_EXCLUDE_RE": lambda: os.environ.get(
++        "VLLM_MARLIN_INT8_EXCLUDE_RE", "lm_head|mtp"
++    ),
++    # syv patch (marlin-repack-staged-sm80)
++    "VLLM_MARLIN_REPACK_STAGED": lambda: os.environ.get("VLLM_MARLIN_REPACK_STAGED"),
+     # The online quantization dtype for humming kernel
+     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
+         os.environ.get("VLLM_HUMMING_ONLINE_QUANT_CONFIG", None)
+diff --git a/vllm/model_executor/kernels/linear/mixed_precision/marlin.py b/vllm/model_executor/kernels/linear/mixed_precision/marlin.py
+index 5a4f652971..891cd3b3ad 100644
+--- a/vllm/model_executor/kernels/linear/mixed_precision/marlin.py
++++ b/vllm/model_executor/kernels/linear/mixed_precision/marlin.py
+@@ -2,8 +2,10 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++
+ import torch
+ 
++import vllm.envs as envs
+ from vllm import _custom_ops as ops
+ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+     MARLIN_SUPPORTED_GROUP_SIZES,
+@@ -29,6 +31,55 @@ from vllm.model_executor.utils import replace_parameter
+ from vllm.platforms import current_platform
+ from vllm.scalar_type import scalar_types
+ 
++# (syv) #27: sm80 (GA100) wedges with Xid 31 during Marlin repack -- not from
++# the repack kernel, but from VMM mapping churn under the per-layer transient
++# allocations around it (the contiguous copy and the pad), after which an
++# unrelated elementwise kernel write-faults asynchronously. ahnguyen17 verified
++# on a CMP 170HX that the same math staged through CPU is bit-exact and
++# Xid-free, which convicts the allocation pattern, not the arithmetic. This is
++# the GPU-resident version of that fix: pad/copy into ONE grow-only staging
++# buffer per device (layer shapes repeat, so it reallocates a handful of times
++# instead of alloc/freeing two transients per layer), hand the SAME values to
++# the repack kernel, get bit-identical output. Costs one max-layer-sized buffer
++# (~141 MB on this stack) that stays resident after load on the cards where it
++# is on -- the card class where the alternative is a wedge-until-reboot.
++# Default: on for compute capability 8.0 exactly, off elsewhere; override with
++# VLLM_MARLIN_REPACK_STAGED=0/1.
++_REPACK_STAGING: dict = {}
++
++
++def _use_staged_repack(device: torch.device) -> bool:
++    env = envs.VLLM_MARLIN_REPACK_STAGED
++    if env is not None:
++        return env == "1"
++    if device.type != "cuda":
++        return False
++    return torch.cuda.get_device_capability(device) == (8, 0)
++
++
++def _staged_pad_qweight(
++    qweight: torch.Tensor, size_n: int, size_k: int, padded_n: int, padded_k: int
++) -> torch.Tensor:
++    """marlin_pad_qweight + .contiguous() through a persistent staging buffer.
++
++    Returns a view holding exactly what the unstaged path would pass to
++    gptq_marlin_repack; the caller must consume it before the next call.
++    """
++    pack_factor = size_k // qweight.size(0)
++    rows, cols = padded_k // pack_factor, padded_n
++    need = rows * cols
++    buf = _REPACK_STAGING.get(qweight.device)
++    if buf is None or buf.numel() < need or buf.dtype != qweight.dtype:
++        _REPACK_STAGING.pop(qweight.device, None)
++        buf = torch.empty(need, dtype=qweight.dtype, device=qweight.device)
++        _REPACK_STAGING[qweight.device] = buf
++    view = buf[:need].view(rows, cols)
++    if (rows, cols) != (qweight.size(0), qweight.size(1)):
++        view.zero_()
++    view[: qweight.size(0), : qweight.size(1)].copy_(qweight)
++    return view
++
++
+ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+ 
+ 
+@@ -96,6 +147,38 @@ class MarlinLinearKernel(MPLinearKernel):
+                 "W8A8 is not supported by marlin kernel."
+             )
+ 
++        # syv patch: the int8-activation Marlin kernel reads the (int16-requantized)
++        # group scales as *unsigned* int16 (marlin_template.h: reinterpret_cast<
++        # uint16_t*>), so checkpoints with negative group scales (AutoRound
++        # symmetric exports have ~50%) produce garbage. Fold the sign into the
++        # int4 codes: s -> -s, q -> -q (uint4b8 code v -> 16 - v, clamped to 15;
++        # v == 0 i.e. q == -8 loses one LSB, extremely rare).
++        if (
++            c.act_type == torch.int8
++            and c.group_size != -1
++            and not c.has_g_idx
++            and not c.zero_points
++        ):
++            _wq = getattr(layer, self.w_q_name)
++            _ws = getattr(layer, self.w_s_name)
++            permute_param_layout_(_wq, input_dim=0, output_dim=1, packed_dim=0)
++            permute_param_layout_(_ws, input_dim=0, output_dim=1)
++            _neg = _ws.data < 0
++            if bool(_neg.any()):
++                _q = _wq.data
++                _rows_per_group = c.group_size // 8
++                _neg_rows = _neg.repeat_interleave(_rows_per_group, dim=0)[: _q.shape[0]]
++                _shifts = torch.arange(0, 32, 4, device=_q.device, dtype=torch.int32)
++                _nib = (_q.unsqueeze(-1) >> _shifts) & 0xF
++                _flip = torch.clamp(16 - _nib, max=15)
++                _nib = torch.where(_neg_rows.unsqueeze(-1), _flip, _nib)
++                _out = torch.zeros_like(_q)
++                for _i in range(8):
++                    _out |= _nib[..., _i] << (4 * _i)
++                _wq.data = _out
++                _ws.data = torch.where(_neg, -_ws.data, _ws.data)
++                del _nib, _flip, _out
++
+         if c.act_type == torch.float8_e4m3fn:
+             ops.marlin_int4_fp8_preprocess(getattr(layer, self.w_q_name), inplace=True)
+             getattr(layer, self.w_s_name).data = (
+@@ -127,6 +210,23 @@ class MarlinLinearKernel(MPLinearKernel):
+         def transform_w_q(x):
+             assert isinstance(x, BasevLLMParameter)
+             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
++            if _use_staged_repack(x.data.device):
++                # (syv) #27: stage contiguous+pad through the persistent buffer
++                # and drop the source before the repack output allocates, so
++                # the only per-layer allocation left is the final weight.
++                staged = _staged_pad_qweight(
++                    x.data, size_n, size_k, padded_n, padded_k
++                )
++                x.data = torch.empty(0, dtype=staged.dtype, device=staged.device)
++                x.data = ops.gptq_marlin_repack(
++                    staged,
++                    perm=layer.g_idx_sort_indices,
++                    size_k=padded_k,
++                    size_n=padded_n,
++                    num_bits=c.weight_type.size_bits,
++                    is_a_8bit=is_a_8bit,
++                )
++                return x
+             x.data = ops.gptq_marlin_repack(
+                 marlin_pad_qweight(
+                     x.data.contiguous(), size_n, size_k, padded_n, padded_k
+diff --git a/vllm/model_executor/layers/quantization/utils/marlin_utils.py b/vllm/model_executor/layers/quantization/utils/marlin_utils.py
+index 3658761d6f..2284750e95 100644
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils.py
+@@ -666,7 +666,17 @@ def get__quant_fp8_method() -> QuantFP8:
+ def get_marlin_input_dtype(prefix: str | None = None):
+     if envs.VLLM_MARLIN_INPUT_DTYPE is None:
+         return
+-    elif envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "int8":
++    # syv patch: per-layer include/exclude regexes for the int8/fp8 activation
++    # path (lm_head is int8-weight -> W8A8 unsupported by marlin; mtp stays 16-bit)
++    import re as _re
++    _exc = envs.VLLM_MARLIN_INT8_EXCLUDE_RE
++    _inc = envs.VLLM_MARLIN_INT8_INCLUDE_RE
++    if prefix is not None:
++        if _exc and _re.search(_exc, prefix):
++            return
++        if _inc and not _re.search(_inc, prefix):
++            return
++    if envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "int8":
+         return torch.int8
+     elif envs.VLLM_MARLIN_INPUT_DTYPE.lower() == "fp8":
+         if not current_platform.is_device_capability(
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index f991f05d74..fe960984b6 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -245,6 +245,8 @@ class Qwen3_5Model(Qwen3NextModel):
+         self.embed_tokens = VocabParallelEmbedding(
+             self.vocab_size,
+             config.hidden_size,
++            quant_config=self.quant_config,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
+         )
+ 
+         def get_layer(prefix: str):
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index 4c064bead7..7025f219a9 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -84,8 +84,31 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
+         self.embed_tokens = VocabParallelEmbedding(
+             self.vocab_size,
+             config.hidden_size,
++            quant_config=vllm_config.quant_config,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
+         )
+ 
++        # syv patch: vocab-truncated draft head. If the checkpoint ships
++        # mtp_draft_vocab_ids.pt (built by build_draft_vocab.py) the drafter
++        # scores only those rows (mtp.draft_lm_head.*) instead of the full
++        # 248k-row lm_head; logits for all other ids are -inf. Speculative
++        # decoding stays exact, only the acceptance rate can change.
++        import os as _os
++        self.draft_lm_head = None
++        self.draft_vocab_ids = None
++        _ids_path = _os.path.join(model_config.model, "mtp_draft_vocab_ids.pt")
++        if _os.path.exists(_ids_path) and _os.environ.get("MTP_DRAFT_VOCAB", "1") != "0":
++            _ids = torch.load(_ids_path, map_location="cpu")
++            self.draft_vocab_ids = _ids
++            self.draft_lm_head = ParallelLMHead(
++                int(_ids.numel()),
++                config.hidden_size,
++                quant_config=vllm_config.quant_config,
++                prefix=maybe_prefix(prefix, "draft_lm_head"),
++            )
++            logger.info("MTP drafter uses a %d-token draft head", int(_ids.numel()))
++
++
+         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
+         # missing from hf_quant_config.json exclude_modules. Force unquantized.
+         # Ref: https://github.com/vllm-project/vllm/pull/38650
+@@ -253,6 +276,12 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        # syv patch: vocab-truncated draft head
++        self.draft_logits_processor = (
++            LogitsProcessor(int(self.model.draft_vocab_ids.numel()))
++            if getattr(self.model, "draft_lm_head", None) is not None
++            else None
++        )
+ 
+     def embed_input_ids(
+         self,
+@@ -304,6 +333,9 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         def remap_weight_names(weights):
+             for name, weight in weights:
++                # syv patch: skip the truncated draft head when it is disabled
++                if "draft_lm_head" in name and self.model.draft_lm_head is None:
++                    continue
+                 if name.startswith("mtp."):
+                     name = name.replace("mtp.", "model.")
+                 elif any(key in name for key in ["embed_tokens", "lm_head"]):
+diff --git a/vllm/renderers/params.py b/vllm/renderers/params.py
+index 3ecd8f4828..c9b6a96db8 100644
+--- a/vllm/renderers/params.py
++++ b/vllm/renderers/params.py
+@@ -151,6 +151,16 @@ class TokenizeParams:
+     max_output_tokens: int = 0
+     """Maximum requested number of output tokens."""
+ 
++    reserve_output_tokens: bool = True
++    """
++    Whether ``max_input_tokens`` reserves room for the requested output
++    tokens (``max_total_tokens - max_output_tokens``).  When ``False`` the
++    prompt is validated against ``max_total_tokens`` alone: any prompt that
++    fits within the model's context is accepted, and the sampling logic
++    clamps generation to the remaining space (finishing with
++    ``finish_reason="length"`` when the context is exhausted).
++    """
++
+     pad_prompt_tokens: int | None = None
+     """
+     Number of tokens to pad to:
+@@ -207,6 +217,9 @@ class TokenizeParams:
+         if self.max_total_tokens is None:
+             return None
+ 
++        if not self.reserve_output_tokens:
++            return self.max_total_tokens
++
+         return self.max_total_tokens - self.max_output_tokens
+ 
+     def __post_init__(self) -> None:
+@@ -241,10 +254,17 @@ class TokenizeParams:
+             and truncate_prompt_tokens is not None
+             and truncate_prompt_tokens > max_input_tokens
+         ):
++            limit_desc = (
++                self.max_total_tokens_param
++                if not self.reserve_output_tokens
++                else (
++                    f"{self.max_total_tokens_param} - "
++                    f"{self.max_output_tokens_param} = {max_input_tokens}"
++                )
++            )
+             raise VLLMValidationError(
+                 f"{self.truncate_prompt_tokens_param}={truncate_prompt_tokens} "
+-                f"cannot be greater than {self.max_total_tokens_param} - "
+-                f"{self.max_output_tokens_param} = {max_input_tokens}. "
++                f"cannot be greater than {limit_desc}. "
+                 f"Please request a smaller truncation size.",
+                 parameter=self.truncate_prompt_tokens_param,
+                 value=truncate_prompt_tokens,
+@@ -304,6 +324,7 @@ class TokenizeParams:
+                 if max_total_tokens is None or max_length is None
+                 else max_total_tokens - max_length
+             ),
++            reserve_output_tokens=self.reserve_output_tokens,
+             pad_prompt_tokens=pad_prompt_tokens,
+             truncate_prompt_tokens=truncate_prompt_tokens,
+             truncation_side=truncation_side,
+@@ -349,15 +370,28 @@ class TokenizeParams:
+ 
+         if self.truncate_prompt_tokens is None:
+             if len(text) > max_input_chars:
++                if self.reserve_output_tokens:
++                    message = (
++                        f"This model's maximum context length is "
++                        f"{self.max_total_tokens} tokens. However, you requested "
++                        f"{self.max_output_tokens} output tokens and your prompt "
++                        f"contains {len(text)} characters (more than "
++                        f"{max_input_chars} characters, which is the upper bound "
++                        f"for {max_input_tokens} input tokens). "
++                        f"Please reduce the length of the input prompt or the "
++                        f"number of requested output tokens."
++                    )
++                else:
++                    message = (
++                        f"This model's maximum context length is "
++                        f"{self.max_total_tokens} tokens. However, your prompt "
++                        f"contains {len(text)} characters (more than "
++                        f"{max_input_chars} characters, which is the upper bound "
++                        f"for {max_input_tokens} input tokens). "
++                        f"Please reduce the length of the input prompt."
++                    )
+                 raise VLLMValidationError(
+-                    f"This model's maximum context length is "
+-                    f"{self.max_total_tokens} tokens. However, you requested "
+-                    f"{self.max_output_tokens} output tokens and your prompt "
+-                    f"contains {len(text)} characters (more than "
+-                    f"{max_input_chars} characters, which is the upper bound "
+-                    f"for {max_input_tokens} input tokens). "
+-                    f"Please reduce the length of the input prompt or the "
+-                    f"number of requested output tokens.",
++                    message,
+                     parameter="input_text",
+                     value=len(text),
+                 )
+@@ -460,15 +494,26 @@ class TokenizeParams:
+             # max_input_tokens + 1 (see get_encode_kwargs), so the
+             # actual prompt length could be larger.
+             qualifier = "at least " if token_count == max_input_tokens + 1 else ""
+-            total = token_count + self.max_output_tokens
++            if self.reserve_output_tokens:
++                total = token_count + self.max_output_tokens
++                message = (
++                    f"This model's maximum context length is "
++                    f"{self.max_total_tokens} tokens. However, you requested "
++                    f"{self.max_output_tokens} output tokens and your prompt "
++                    f"contains {qualifier}{token_count} input tokens, "
++                    f"for a total of {qualifier}{total} tokens. "
++                    f"Please reduce the length of the input prompt or the "
++                    f"number of requested output tokens."
++                )
++            else:
++                message = (
++                    f"This model's maximum context length is "
++                    f"{self.max_total_tokens} tokens. However, your prompt "
++                    f"contains {qualifier}{token_count} input tokens. "
++                    f"Please reduce the length of the input prompt."
++                )
+             raise VLLMValidationError(
+-                f"This model's maximum context length is "
+-                f"{self.max_total_tokens} tokens. However, you requested "
+-                f"{self.max_output_tokens} output tokens and your prompt "
+-                f"contains {qualifier}{token_count} input tokens, "
+-                f"for a total of {qualifier}{total} tokens. "
+-                f"Please reduce the length of the input prompt or the "
+-                f"number of requested output tokens.",
++                message,
+                 parameter="input_tokens",
+                 value=token_count,
+             )
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 83ed59799e..6bd6bc5e20 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2059,6 +2059,20 @@ class Scheduler(SchedulerInterface):
+                 finished = self._handle_stopped_request(request)
+                 if finished:
+                     kv_transfer_params, ec_transfer_params = self._free_request(request)
++                    # 0.28.0 logged zero request-completion lines (1473 "Added"
++                    # lines vs 0 finish lines in 21.5 h of serving on a single
++                    # 3090), which made a completed request, a silently dropped
++                    # one, and a wedged one indistinguishable in the log. Emit
++                    # one line per request that leaves the scheduler finished.
++                    logger.info(
++                        "Request finished: req %s finish_reason=%s "
++                        "prompt_tokens=%d generated_tokens=%d elapsed_s=%.2f",
++                        request.request_id,
++                        getattr(finish_reason, "type", finish_reason),
++                        request.num_prompt_tokens,
++                        len(request.output_token_ids),
++                        max(0.0, time.time() - request.arrival_time),
++                    )
+ 
+                 if status_before_stop == RequestStatus.RUNNING:
+                     stopped_running_reqs.add(request)
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index c734e67229..8294380b8c 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -102,6 +102,68 @@ HANDSHAKE_TIMEOUT_MINS = 5
+ _R = TypeVar("_R")  # Return type for collective_rpc
+ 
+ 
++class _StallSentinel:
++    """Detects the "engine core stopped stepping while requests are live"
++    failure class, and logs one warning line per stall episode.
++
++    The sentinel reads the scheduler's request counts itself on every tick
++    rather than from a snapshot the main loop refreshes, so a core that stops
++    stepping with a stale snapshot (e.g. a request parked
++    WAITING_FOR_REMOTE_KVS while the loop falls through to the input queue)
++    is still reported against its current state. `_last_done` is a plain
++    float written only by the main loop; a lock here could participate in
++    exactly the cross-thread stall this class exists to report. The thread is
++    a daemon; it dies with the EngineCore process.
++    """
++
++    def __init__(
++        self,
++        get_counts,
++        threshold_s: float,
++        check_interval_s: float = 5.0,
++    ):
++        self._get_counts = get_counts
++        self._threshold_s = threshold_s
++        self._check_interval_s = check_interval_s
++        self._last_done = time.monotonic()
++        self._stall_logged = False
++        self._stop = threading.Event()
++        self._thread = threading.Thread(
++            target=self._run, name="EngineCoreStallSentinel", daemon=True
++        )
++        self._thread.start()
++
++    def step_done(self) -> None:
++        # A step completed: refresh the clock.
++        self._last_done = time.monotonic()
++        self._stall_logged = False
++
++    def stop(self) -> None:
++        self._stop.set()
++
++    def _run(self) -> None:
++        while not self._stop.wait(self._check_interval_s):
++            gap = time.monotonic() - self._last_done
++            if gap < self._threshold_s or self._stall_logged:
++                continue
++            try:
++                running, waiting = self._get_counts()
++            except Exception:  # noqa: BLE001 - never kill the sentinel
++                continue
++            if (running + waiting) > 0:
++                self._stall_logged = True
++                logger.warning(
++                    "EngineCore stall: no completed step for %.0f s "
++                    "(threshold %.0f s) while %d running / %d waiting "
++                    "request(s) are live; the engine may have "
++                    "stopped stepping (client streams will hold).",
++                    gap,
++                    self._threshold_s,
++                    running,
++                    waiting,
++                )
++
++
+ class EngineCore:
+     """Inner loop of vLLM's Engine."""
+ 
+@@ -1098,6 +1160,24 @@ class EngineCoreProc(EngineCore):
+                 internal_dp_balancing,
+             )
+ 
++            # Optional stall sentinel (off by default):
++            #   VLLM_ENGINE_STALL_SENTINEL_S=<seconds>
++            # Warns once per episode when the core stops completing steps
++            # while requests are still alive -- the failure class that logs
++            # nothing else in V1 (no stats line, no completion line, no
++            # error). Constructed here, after super().__init__(), because
++            # that is what creates self.scheduler.
++            self._stall_sentinel: _StallSentinel | None = None
++            _stall_thresh = envs.VLLM_ENGINE_STALL_SENTINEL_S
++            if _stall_thresh > 0:
++                self._stall_sentinel = _StallSentinel(
++                    self.scheduler.get_request_counts, _stall_thresh
++                )
++                logger.info(
++                    "EngineCore stall sentinel enabled (threshold %.0f s)",
++                    _stall_thresh,
++                )
++
+             # Initialize fault tolerance settings.
+             self.enable_fault_tolerance = (
+                 vllm_config.parallel_config.enable_fault_tolerance
+@@ -1475,6 +1555,8 @@ class EngineCoreProc(EngineCore):
+             self.output_queue.put_nowait(output)
+         # Post-step hook.
+         self.post_step(model_executed)
++        if self._stall_sentinel is not None:
++            self._stall_sentinel.step_done()
+ 
+         # If no model execution happened but there is still scheduler work
+         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
