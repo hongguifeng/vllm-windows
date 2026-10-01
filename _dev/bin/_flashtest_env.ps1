@@ -31,7 +31,7 @@ $env:UCRTVersion       = $SDKVER
 $env:WindowsSdkBinPath = "$SDKROOT\bin\$SDKVER\"
 
 $env:INCLUDE = "$MSVC\include;$SDKROOT\Include\$SDKVER\ucrt;$SDKROOT\Include\$SDKVER\shared;$SDKROOT\Include\$SDKVER\um;$SDKROOT\Include\$SDKVER\winrt;$SDKROOT\Include\$SDKVER\cppwinrt"
-$env:LIB     = "$MSVC\lib\x64;$SDKROOT\Lib\$SDKVER\ucrt\x64;$SDKROOT\Lib\$SDKVER\um\x64"
+$env:LIB     = "$MSVC\lib\x64;$SDKROOT\Lib\$SDKVER\ucrt\x64;$SDKROOT\Lib\$SDKVER\um\x64;$CUDAROOT\lib\x64"
 $env:LIBPATH = "$MSVC\lib\x64"
 $env:PATH    = "$MSVC\bin\Hostx64\x64;$SDKROOT\bin\$SDKVER\x64;$Repo\.venv\Scripts;$CUDAROOT\bin;$env:PATH"
 
