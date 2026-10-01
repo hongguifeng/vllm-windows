@@ -5,13 +5,13 @@
 1. **The next verification step’s draft token values normally remain on the GPU.** The scheduler has their count and `-1` placeholders, not their values.
 2. **Your measured engine uses the batch-queue path.** That path can submit step N before processing step N−1’s output on the host. Single-request serving and `VLLM_ENABLE_V1_MULTIPROCESSING=0` do not disable that overlap.
 
-I inspected `D:/code/vllm-flashtest/vllm/` and verified that the key files below are byte-identical to their deployed `.venv/Lib/site-packages/vllm/` copies. I made no changes and ran no GPU work.
+I inspected `D:/code/vllm-windows/vllm/` and verified that the key files below are byte-identical to their deployed `.venv/Lib/site-packages/vllm/` copies. I made no changes and ran no GPU work.
 
 This does **not** kill earlier PLE lookup. It changes the proposal from “derive already-known IDs on the host” into **“make a complete, correctly versioned input snapshot available earlier, then derive IDs.”** That extra dependency must be priced before implementation.
 
 ## 1. What the Triton path reads—and what is missing on the host
 
-All source paths below are relative to `D:/code/vllm-flashtest/vllm/`.
+All source paths below are relative to `D:/code/vllm-windows/vllm/`.
 
 ### The hash itself is entirely token-derived
 

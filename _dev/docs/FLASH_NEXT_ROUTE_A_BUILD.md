@@ -1,11 +1,11 @@
 # 路线 A：在 worktree 上把 Flash-Next 树编成 Windows 版本
 
-记录 `D:\code\vllm-flashtest` 这条分支怎么搭起来、编到哪儿、踩了哪些 MSVC 的坑。
+记录 `D:\code\vllm-windows` 这条分支怎么搭起来、编到哪儿、踩了哪些 MSVC 的坑。
 可行性判断本身在 `FLASH_NEXT_WINDOWS_FEASIBILITY.md`，这份只记施工过程。
 
 ## 1. 分支构成
 
-`flash-next-win` @ `D:\code\vllm-flashtest`（git worktree，共享主仓库的对象库）：
+`flash-next-win` @ `D:\code\vllm-windows`（git worktree，共享主仓库的对象库）：
 
 | commit | 内容 |
 |---|---|
@@ -213,7 +213,7 @@ humming/csrc/patch_cubin.cpp   # 两个入口加 __declspec(dllexport)
 回滚（PowerShell，在 flashtest venv 的 site-packages 里）：
 
 ```powershell
-$sp = 'D:\code\vllm-flashtest\.venv\Lib\site-packages\humming'
+$sp = 'D:\code\vllm-windows\.venv\Lib\site-packages\humming'
 foreach ($f in 'utils\device.py','utils\nvrtc.py','utils\cubin.py','ops\utils.py',
                'csrc\launcher\mapped_file.h','csrc\nvrtc_compile.cpp','csrc\patch_cubin.cpp') {
   Copy-Item "$sp\$f.orig" "$sp\$f" -Force
@@ -1745,7 +1745,7 @@ $env:CUDA_VISIBLE_DEVICES = '1'
 & 'C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.1.3\target-windows-x64\nsys.exe' `
   profile --trace cuda,nvtx --force-overwrite true `
   --output D:\code\vllm-windows\_dev\out\nsys\belly2 `
-  D:\code\vllm-flashtest\.venv\Scripts\python.exe `
+  D:\code\vllm-windows\.venv\Scripts\python.exe `
   D:\code\vllm-windows\_dev\probe\_cuda_belly.py --ops 200 --size 2048
 & 'C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.1.3\target-windows-x64\nsys.exe' `
   stats --report cuda_gpu_kern_sum D:\code\vllm-windows\_dev\out\nsys\belly2.nsys-rep
@@ -1813,9 +1813,9 @@ SSD 直读读的就是模型目录自己的 safetensors（没有独立的 `vllm_
 
 ### 37.2 服务器 import 的是哪一份 vLLM（此前一直没钉死）
 
-最近所有起服都传了 `-Venv D:\code\vllm-flashtest`，所以**运行副本**是
-`D:\code\vllm-flashtest\.venv\Lib\site-packages\vllm`（引擎 `v0.1.dev21640+gb629bcc71`），它是
-`D:\code\vllm-flashtest` 这个 worktree（branch `flash-next-win`，`d9e51eec8f`）的一份安装。运行副本
+最近所有起服都传了 `-Venv D:\code\vllm-windows`，所以**运行副本**是
+`D:\code\vllm-windows\.venv\Lib\site-packages\vllm`（引擎 `v0.1.dev21640+gb629bcc71`），它是
+`D:\code\vllm-windows` 这个 worktree（branch `flash-next-win`，`d9e51eec8f`）的一份安装。运行副本
 的 `model.py` 与 worktree 源码在归一化行尾之后**逐字节同内容**（各 1103 行，diff 0 hunk）⇒ 改源码再
 拷进 venv 是安全的，也不存在"装了但源码没有"的暗改。
 
@@ -1941,7 +1941,7 @@ device record + 26 条 host query）不可能让解码变快，所以这就是�
 
 | 构建串 | 起服次数 | 是哪份 |
 |---|---|---|
-| `v0.1.dev21640+gb629bcc71` | **55** | worktree `D:\code\vllm-flashtest`（branch `flash-next-win`）的 venv |
+| `v0.1.dev21640+gb629bcc71` | **55** | worktree `D:\code\vllm-windows`（branch `flash-next-win`）的 venv |
 | `v0.29.1.dev0+g13e844c86.d20260926` | **2** | 主仓 `D:\code\vllm-windows` 的 venv（路线 A 编的 main），09-27 19:39/19:49，struct 视图 + eager |
 | 构建串取不到 | 3 | 没走到 EngineCore 行 |
 
@@ -2004,8 +2004,8 @@ KV（bytes 还是 utilization）、他们开没开 async scheduling、他们的 
 ### 39.7 新坑：bash → `powershell.exe` 会吃掉 Windows 路径里的反斜杠
 
 ```
--Venv D:\code\vllm-flashtest      → 绑定成 [D:codevllm-flashtest]  ⇒ 5 个原生件全报 missing
--Venv 'D:\code\vllm-flashtest'    → 绑定成 [D:\code\vllm-flashtest] ⇒ missing count = 0
+-Venv D:\code\vllm-windows      → 绑定成 [D:codevllm-windows]  ⇒ 5 个原生件全报 missing
+-Venv 'D:\code\vllm-windows'    → 绑定成 [D:\code\vllm-windows] ⇒ missing count = 0
 ```
 
 ⇒ 从 MSYS bash 调 `powershell.exe -File`，**每个 Windows 路径都要加引号**（或

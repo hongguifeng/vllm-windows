@@ -94,7 +94,7 @@ Recording the anchor at the first `_start_layer_ple_prefetch` is too late. That 
 
 For the deployed V2 runner, the correct boundary is in:
 
-[model_runner.py:1892](D:/code/vllm-flashtest/.venv/Lib/site-packages/vllm/v1/worker/gpu/model_runner.py:1892)
+[model_runner.py:1892](D:/code/vllm-windows/.venv/Lib/site-packages/vllm/v1/worker/gpu/model_runner.py:1892)
 
 Place the prefix event after input preparation and immediately before the model execution dispatch:
 
@@ -104,11 +104,11 @@ Place the prefix event after input preparation and immediately before the model 
 
 For the active breakable path, the useful position is immediately before:
 
-[model_runner.py:1944](D:/code/vllm-flashtest/.venv/Lib/site-packages/vllm/v1/worker/gpu/model_runner.py:1944)
+[model_runner.py:1944](D:/code/vllm-windows/.venv/Lib/site-packages/vllm/v1/worker/gpu/model_runner.py:1944)
 
 That event must be recorded outside CUDA graph capture. The existing preserve event is recorded in the eager PLE segment after the graph segment has replayed, at the point corresponding to:
 
-[ple_ssd.py:710](D:/code/vllm-flashtest/.venv/Lib/site-packages/vllm/models/qwen4_exp/nvidia/ple_ssd.py:710)
+[ple_ssd.py:710](D:/code/vllm-windows/.venv/Lib/site-packages/vllm/models/qwen4_exp/nvidia/ple_ssd.py:710)
 
 Conceptually, the minimal instrumentation is:
 

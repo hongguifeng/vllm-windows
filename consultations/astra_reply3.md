@@ -8,7 +8,7 @@ Three important qualifications:
 2. **40% sampled GPU utilization does not establish 60% schedulable spare capacity.** Dependency gaps, serial kernels, and resource contention determine whether useful work can occupy those intervals.
 3. **Your current traffic script measures request-level completion throughput, not isolated decode throughput.** In `_dev/probe/_c1_traffic.py`, the denominator includes the entire non-streaming HTTP request, including prefill and response handling. Consequently, acceptance divided by that rate is an *inferred effective step time*, not a directly measured engine-step duration.
 
-I read both previous replies, section 19, the traffic script, and the implementation under `D:/code/vllm-flashtest/`. **I changed nothing, ran no benchmarks, and accessed neither GPU.**
+I read both previous replies, section 19, the traffic script, and the implementation under `D:/code/vllm-windows/`. **I changed nothing, ran no benchmarks, and accessed neither GPU.**
 
 ---
 
@@ -219,7 +219,7 @@ Those are illustrative, not substitutes for actual counters; termination and par
 
 I checked the actual formula in:
 
-`D:/code/vllm-flashtest/vllm/models/qwen4_exp/common/qsa_cache.py`
+`D:/code/vllm-windows/vllm/models/qwen4_exp/common/qsa_cache.py`
 
 ```python
 span = self.compress_ratio + vllm_config.num_speculative_tokens

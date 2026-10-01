@@ -179,9 +179,9 @@ Tell us where you disagree and why.
 
 - `D:\code\vllm-windows\_dev\probe\_ple_win_sem.c` and
   `_dev\bin\_ple_win_sem_build_run.ps1` (CPU-only reader probe)
-- `D:\code\vllm-flashtest\vllm\models\qwen4_exp\nvidia\ple_ssd_io_win.c`
+- `D:\code\vllm-windows\vllm\models\qwen4_exp\nvidia\ple_ssd_io_win.c`
   (EOF branch now uses the page-rounded request)
-- `D:\code\vllm-flashtest\vllm\triton_utils\prepared.py` (strict mode now falls back)
+- `D:\code\vllm-windows\vllm\triton_utils\prepared.py` (strict mode now falls back)
 - `D:\code\vllm-windows\_dev\probe\_prepared_launch_test.py` (22 checks incl. forced fallback)
 - `D:\code\vllm-windows\_dev\probe\_step_rate.py` (step rate from the step-stats log)
 - `D:\code\vllm-windows\consultations\astra_reply1.md` (your round-1 reply, in full)

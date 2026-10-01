@@ -41,8 +41,8 @@ host-offload 语义手工后移到 v0.29.0。** 后者约等于重写上游一�
 证据（已做过，不是推测）：
 
 ```
-git worktree add --detach D:\code\vllm-flashtest origin/main   # 128 MB
-cd D:\code\vllm-flashtest && git apply --check -v .../qwen38-ple-ssd.patch
+git worktree add --detach D:\code\vllm-windows origin/main   # 128 MB
+cd D:\code\vllm-windows && git apply --check -v .../qwen38-ple-ssd.patch
 → 13 个文件全部 Checking 通过，零 error
 ```
 
@@ -159,7 +159,7 @@ extent 后命中了自己的 standby list —— **同一个文件被同一个�
    所以这一条的答案是“否”，且原因不是 Windows。
 3. 第 2 条的“便宜证伪”已经付过钱了，而且它否掉的是另一件事：烟测证明**路线 A 是前提而不是选项**。
    §7 用实测把这笔大钱拆成了可数的 16 个冲突文件。
-   落地点：`git worktree add D:\code\vllm-flashtest origin/main` → `git apply qwen38-ple-ssd.patch`
+   落地点：`git worktree add D:\code\vllm-windows origin/main` → `git apply qwen38-ple-ssd.patch`
    → 把 win32 依赖分支和 build 修复 forward-port 过去 → 再把 `ple_ssd.py` 的 reader 换成
    Windows buffered 线程实现（Linux AIO 那条 `_native` 路径直接不要）。
 4. 起服参数按 60 GiB 可用重算：`--gpu-memory-utilization`、`--max-model-len`、graph capture 上限都要
@@ -179,8 +179,8 @@ extent 后命中了自己的 standby list —— **同一个文件被同一个�
   （`--file` 指到大于内存的文件即可测冷盘）。
 - `_dev/out/wsl_flash_next/`：从容器里取出的 `ple_ssd.py` / `ple_ssd_io.c` / `ngram_embedding.py` /
   `model_state.py` / `mtp.py`，以及 `qwen38-ple-ssd.patch` 的本地副本。
-- `D:\code\vllm-flashtest`：`origin/main` 的临时 worktree（128 MB），补丁在此干净通过，
-  是第 4 节的落地位置。不需要时 `git worktree remove D:\code\vllm-flashtest`。
+- `D:\code\vllm-windows`：`origin/main` 的临时 worktree（128 MB），补丁在此干净通过，
+  是第 4 节的落地位置。不需要时 `git worktree remove D:\code\vllm-windows`。
 - `_dev/probe/_flashnext_trim.py`：造“PLE-free 视图”（hardlink + 改 `index.json` /
   `ple_layer_ids: []`），输出到 `D:\models\Qwen3.8-Flash-Next-struct`。
 - `_dev/bin/_flashnext_struct_serve.ps1`：烟测专用的起服脚本（GPU1 / eager / `--language-model-only`，

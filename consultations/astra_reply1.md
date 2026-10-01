@@ -4,7 +4,7 @@ I did not execute or modify anything.
 
 **Q1. Highest-risk defect and how I would test it**
 
-The most concrete source-level defect is the EOF decision in [`ple_ssd_io_win.c`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:213).
+The most concrete source-level defect is the EOF decision in [`ple_ssd_io_win.c`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:213).
 
 The code decides whether to use the buffered exact-read path with:
 
@@ -44,7 +44,7 @@ Expected decision:
 | Any mismatch or `ERROR_INVALID_PARAMETER` at a page/EOF boundary | Reader has a correctness defect | Fix the fallback condition before further performance work |
 | All rows match, including exact EOF and cross-page cases | This defect is not triggered by the checkpoint layout | Keep the test permanently; continue to lifecycle testing |
 
-The second high-risk issue is that both handles are opened without `FILE_FLAG_OVERLAPPED` in [`rows_bind`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:142), while [`start_req`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:213) passes an `OVERLAPPED` structure to `ReadFile`, expects `ERROR_IO_PENDING`, and waits on the event.
+The second high-risk issue is that both handles are opened without `FILE_FLAG_OVERLAPPED` in [`rows_bind`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:142), while [`start_req`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:213) passes an `OVERLAPPED` structure to `ReadFile`, expects `ERROR_IO_PENDING`, and waits on the event.
 
 The current flags are:
 
@@ -72,7 +72,7 @@ I would make this explicit rather than relying on observed behavior:
 - Verify `GetOverlappedResult` returns the expected byte count.
 - Run the test on a cold file and a hot file.
 
-The third issue is teardown. [`kill_reader`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:197) calls `CancelIoEx`, marks the reader dead, and returns. [`rows_close`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:81) then closes events, buffers, and file handles without draining or waiting for cancelled operations.
+The third issue is teardown. [`kill_reader`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:197) calls `CancelIoEx`, marks the reader dead, and returns. [`rows_close`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:81) then closes events, buffers, and file handles without draining or waiting for cancelled operations.
 
 That creates a possible use-after-close sequence:
 
@@ -84,7 +84,7 @@ That creates a possible use-after-close sequence:
 
 This may be rare, but it is a serious failure-mode risk because the code intentionally turns all I/O errors into terminal reader failure. The test should force a timeout or injected read failure, immediately call `close`, and repeat this in a subprocess. Run hundreds or thousands of cycles under Application Verifier if available. This is CPU-only and should cost less than an hour.
 
-The depth clamp itself is correct for the chosen design. `WaitForMultipleObjects` accepts at most `MAXIMUM_WAIT_OBJECTS`, which is 64 on Windows. [`rows_open`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:101) clamps the requested depth and [`rows_depth`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:56) reports the effective depth. The Python log already reports both values. I would add an assertion in the CPU test that:
+The depth clamp itself is correct for the chosen design. `WaitForMultipleObjects` accepts at most `MAXIMUM_WAIT_OBJECTS`, which is 64 on Windows. [`rows_open`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:101) clamps the requested depth and [`rows_depth`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd_io_win.c:56) reports the effective depth. The Python log already reports both values. I would add an assertion in the CPU test that:
 
 ```text
 requested depth 256 -> reported depth 64
@@ -94,10 +94,10 @@ requested depth 1   -> reported depth 1
 
 There are smaller robustness issues:
 
-- `_open_read_fd` can leak the Win32 handle if `msvcrt.open_osfhandle` raises after `CreateFileW` succeeds ([`ple_ssd.py`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd.py:43)).
-- `is_pin_memory_available()` returns `True` on all native Windows CUDA systems ([`cuda.py`](D:/code/vllm-flashtest/vllm/platforms/cuda.py:306)), although pinned allocation can still fail under host-memory pressure. The PLE object allocates several potentially large pinned buffers at initialization ([`ple_ssd.py`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd.py:488)). The failure mode should be a clear fallback or startup error rather than a later opaque allocation failure.
-- The host cache is serialized correctly by `PLESSSDTable.read`, but the prompt prefetcher only permits one active prompt prefetch. A second request arriving while the first is active is silently skipped ([`ple_ssd.py`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd.py:416)). This should affect only prefetch effectiveness, not correctness, but it should be counted.
-- `prepare_dummy_inputs` divides by `num_reqs` ([`model_state.py`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/model_state.py:146). If zero-request dummy capture is possible in any warmup path, this needs an explicit guard.
+- `_open_read_fd` can leak the Win32 handle if `msvcrt.open_osfhandle` raises after `CreateFileW` succeeds ([`ple_ssd.py`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd.py:43)).
+- `is_pin_memory_available()` returns `True` on all native Windows CUDA systems ([`cuda.py`](D:/code/vllm-windows/vllm/platforms/cuda.py:306)), although pinned allocation can still fail under host-memory pressure. The PLE object allocates several potentially large pinned buffers at initialization ([`ple_ssd.py`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd.py:488)). The failure mode should be a clear fallback or startup error rather than a later opaque allocation failure.
+- The host cache is serialized correctly by `PLESSSDTable.read`, but the prompt prefetcher only permits one active prompt prefetch. A second request arriving while the first is active is silently skipped ([`ple_ssd.py`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd.py:416)). This should affect only prefetch effectiveness, not correctness, but it should be counted.
+- `prepare_dummy_inputs` divides by `num_reqs` ([`model_state.py`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/model_state.py:146). If zero-request dummy capture is possible in any warmup path, this needs an explicit guard.
 - The n-gram context logic should be tested with speculative rejection, request removal/reuse, chunked-prefill boundaries, and padded empty requests. The EOS fill and negative-index masking look structurally sensible, but these are the cases most likely to expose stale context.
 
 The seven site-packages humming edits are a reproducibility risk rather than an immediate runtime defect. Archive them now as a patch series with the exact package versions and hashes. The unconditional incremental-compile hunk should also be made environment-gated before anyone rebases or reinstalls the environment.
@@ -106,7 +106,7 @@ The seven site-packages humming edits are a reproducibility risk rather than an 
 
 For the measured single-stream workload, the conclusion is reasonably supported, but the strict experiment is weaker than described.
 
-The strict verifier calls Triton’s original path with `warmup=True` in [`_strict_check`](D:/code/vllm-flashtest/vllm/triton_utils/prepared.py:117). That checks which compiled kernel Triton selects, but it does not reproduce the full normal launch path. It also ignores the Boolean result:
+The strict verifier calls Triton’s original path with `warmup=True` in [`_strict_check`](D:/code/vllm-windows/vllm/triton_utils/prepared.py:117). That checks which compiled kernel Triton selects, but it does not reproduce the full normal launch path. It also ignores the Boolean result:
 
 ```python
 _strict_check(...)
@@ -198,7 +198,7 @@ The coordinator executes:
 self._ids_ready.synchronize()
 ```
 
-inside `_read_and_copy` ([`ple_ssd.py`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd.py:538)). A py-spy sample showing that stack proves where the coordinator is blocked or executing. It does not distinguish:
+inside `_read_and_copy` ([`ple_ssd.py`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd.py:538)). A py-spy sample showing that stack proves where the coordinator is blocked or executing. It does not distinguish:
 
 - an OS-blocked CUDA wait,
 - a driver spin wait consuming CPU,
@@ -238,7 +238,7 @@ The first implementation would expose the exact event dependency:
 - timestamp `_copy_ready`,
 - timestamp the consumer.
 
-The goal is to establish whether the broad `self._stream.wait_stream(torch.cuda.current_stream())` in [`start_prefetch`](D:/code/vllm-flashtest/vllm/models/qwen4_exp/nvidia/ple_ssd.py:573) is delaying the ID copy behind unrelated current-stream work. If an event can be recorded immediately after the ID producer, waiting on that event may be a much cheaper change than a GPU cache.
+The goal is to establish whether the broad `self._stream.wait_stream(torch.cuda.current_stream())` in [`start_prefetch`](D:/code/vllm-windows/vllm/models/qwen4_exp/nvidia/ple_ssd.py:573) is delaying the ID copy behind unrelated current-stream work. If an event can be recorded immediately after the ID producer, waiting on that event may be a much cheaper change than a GPU cache.
 
 After that, I would choose between the remaining options as follows:
 
