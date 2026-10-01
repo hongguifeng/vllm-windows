@@ -189,9 +189,10 @@ class _TraceSlot:
 class PLESSDNativeReader:
     """Bounded asynchronous reads; the native call releases the Python GIL.
 
-    Linux uses direct AIO through a duplicated O_DIRECT descriptor. Windows has
-    no AIO, so the helper reads via handles it opens itself and the descriptor the
-    table already holds only serves as an identity key for that file.
+    Linux uses direct AIO through a duplicated O_DIRECT descriptor. Windows
+    uses overlapped reads through an I/O completion port; the helper opens the
+    checkpoint handles itself and the descriptor the table already holds only
+    serves as an identity key for that file.
     """
 
     def __init__(self, table, library: str, depth: int) -> None:
@@ -381,9 +382,7 @@ class PLESSDTable:
         # Windows seek+read is stateful per descriptor, so workers need a lock
         # per file; POSIX pread needs none.
         self._locks = (
-            {fd: threading.Lock() for fd in self._fds.values()}
-            if _IS_WINDOWS
-            else {}
+            {fd: threading.Lock() for fd in self._fds.values()} if _IS_WINDOWS else {}
         )
         self._native = None
         self._pool = None
@@ -437,9 +436,7 @@ class PLESSDTable:
                 self._reading = False
                 self._condition.notify_all()
 
-    def _read(
-        self, ids: np.ndarray, output: np.ndarray, prefetch: bool
-    ) -> None:
+    def _read(self, ids: np.ndarray, output: np.ndarray, prefetch: bool) -> None:
         """Fill a byte buffer in request order, preserving duplicate rows."""
         flat = ids.reshape(-1)
         if output.shape != (flat.size, self.row_bytes) or output.dtype != np.uint8:
@@ -880,9 +877,7 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         if slot is not None:
             slot.h_pending = t0
             slot.h_pending_end = time.perf_counter()
-            slot.h_ids_seen = (
-                time.perf_counter() if self._ids_ready.query() else 0.0
-            )
+            slot.h_ids_seen = time.perf_counter() if self._ids_ready.query() else 0.0
             slot.events[7].record(torch.cuda.current_stream())
         self._pending = None
         self._trace_slot = None

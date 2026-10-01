@@ -70,7 +70,18 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
 
         rope_scaling = kwargs.get("rope_scaling")
         rope_theta = kwargs.get("rope_theta", 10_000.0)
-        super().__init__(layer_types=layer_types, **kwargs)
+        original_layer_types = list(layer_types) if layer_types is not None else None
+        normalized_layer_types = (
+            [
+                "full_attention" if layer_type == QSA_LAYER_TYPE else layer_type
+                for layer_type in layer_types
+            ]
+            if layer_types is not None
+            else None
+        )
+        super().__init__(layer_types=normalized_layer_types, **kwargs)
+        if original_layer_types is not None:
+            self.layer_types = original_layer_types
 
         normalized_rope_parameters = self.rope_parameters
         self.rope_scaling = (

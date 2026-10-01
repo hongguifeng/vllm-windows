@@ -1,20 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Apply the Windows humming-kernels 0.1.15 runtime port.
 
 The upstream wheel has Linux-only native artifact names and build paths.  This
 script keeps the port reproducible while leaving .orig backups beside every
 modified site-packages file.
 """
+
 from __future__ import annotations
 
 import argparse
 import shutil
 from pathlib import Path
 
-
 FILES = (
     Path("utils/device.py"),
     Path("utils/nvrtc.py"),
     Path("utils/cubin.py"),
+    Path("jit/compiler.py"),
     Path("ops/utils.py"),
     Path("csrc/launcher/mapped_file.h"),
     Path("csrc/nvrtc_compile.cpp"),
@@ -25,6 +29,8 @@ FILES = (
 def replace_once(path: Path, old: str, new: str) -> None:
     text = path.read_text(encoding="utf-8")
     count = text.count(old)
+    if text.count(new) == 1 and old not in text.replace(new, "", 1):
+        return
     if count != 1:
         raise RuntimeError(f"{path}: expected one match, found {count}")
     path.write_text(text.replace(old, new), encoding="utf-8", newline="")
@@ -34,17 +40,17 @@ def apply_device(path: Path) -> None:
     replace_once(
         path,
         '    extension_name = "_device_info.abi3.so"\n',
-        '    extension_name = (\n'
+        "    extension_name = (\n"
         '        "_device_info.pyd" if sys.platform == "win32"\n'
         '        else "_device_info.abi3.so"\n'
-        '    )\n',
+        "    )\n",
     )
 
 
 def apply_nvrtc(path: Path) -> None:
     replace_once(
         path,
-        '''def _select_nvrtc_lib(lib_dir):
+        """def _select_nvrtc_lib(lib_dir):
     unversioned = os.path.join(lib_dir, "libnvrtc.so")
     if os.path.exists(unversioned):
         return unversioned
@@ -52,8 +58,8 @@ def apply_nvrtc(path: Path) -> None:
     if versioned:
         return versioned[-1]
     return None
-''',
-        '''def _select_nvrtc_lib(lib_dir):
+""",
+        """def _select_nvrtc_lib(lib_dir):
     if sys.platform == "win32":
         versioned = sorted(glob.glob(os.path.join(lib_dir, "nvrtc*.dll")))
         return versioned[-1] if versioned else None
@@ -64,18 +70,18 @@ def apply_nvrtc(path: Path) -> None:
     if versioned:
         return versioned[-1]
     return None
-''',
+""",
     )
     replace_once(
         path,
-        '''    candidates = [
+        """    candidates = [
         os.path.join(root, "lib64"),
         os.path.join(root, "lib"),
         *sorted(glob.glob(os.path.join(root, "*", "lib64"))),
         *sorted(glob.glob(os.path.join(root, "*", "lib"))),
     ]
-''',
-        '''    if sys.platform == "win32":
+""",
+        """    if sys.platform == "win32":
         cuda_path = os.environ.get("CUDA_PATH")
         if cuda_path:
             root = cuda_path
@@ -89,20 +95,18 @@ def apply_nvrtc(path: Path) -> None:
             *sorted(glob.glob(os.path.join(root, "*", "lib64"))),
             *sorted(glob.glob(os.path.join(root, "*", "lib"))),
         ]
-''',
+""",
     )
     old = '        raise RuntimeError("Could not locate libnvrtc.so in CUDA path")\n'
+    new = '        raise RuntimeError("Could not locate NVRTC in CUDA path")\n'
     text = path.read_text(encoding="utf-8")
-    if text.count(old) != 2:
+    if text.count(old) == 2:
+        path.write_text(text.replace(old, new), encoding="utf-8", newline="")
+    elif text.count(old) != 0 or text.count(new) != 2:
         raise RuntimeError(f"{path}: expected two NVRTC error messages")
-    path.write_text(
-        text.replace(old, '        raise RuntimeError("Could not locate NVRTC in CUDA path")\n'),
-        encoding="utf-8",
-        newline="",
-    )
     replace_once(
         path,
-        '''    cmd = [
+        """    cmd = [
         compiler,
         "-O2",
         "-std=c++17",
@@ -112,8 +116,8 @@ def apply_nvrtc(path: Path) -> None:
         "-o",
         str(tmp_path),
     ]
-''',
-        '''    if sys.platform == "win32":
+""",
+        """    if sys.platform == "win32":
         tmp_path = output_path.with_name(output_path.stem + ".tmp.exe")
         cmd = [
             compiler,
@@ -137,28 +141,28 @@ def apply_nvrtc(path: Path) -> None:
             "-o",
             str(tmp_path),
         ]
-''',
+""",
     )
     replace_once(
         path,
-        '    native_path = jit_utils.get_precompiled_artifact_path(src_path, "nvrtc_compile")\n',
-        '    artifact_name = "nvrtc_compile.exe" if sys.platform == "win32" else "nvrtc_compile"\n'
-        '    native_path = jit_utils.get_precompiled_artifact_path(src_path, artifact_name)\n',
+        "    native_path = jit_utils.get_precompiled_artifact_path("
+        'src_path, "nvrtc_compile")\n',
+        '    artifact_name = "nvrtc_compile.exe" if sys.platform == "win32" '
+        'else "nvrtc_compile"\n'
+        "    native_path = jit_utils.get_precompiled_artifact_path("
+        "src_path, artifact_name)\n",
     )
     replace_once(
         path,
         '    binary_path = build_dir / "nvrtc_compile"\n',
-        '    binary_path = build_dir / ("nvrtc_compile.exe" if sys.platform == "win32" else "nvrtc_compile")\n',
+        '    binary_path = build_dir / ("nvrtc_compile.exe" '
+        'if sys.platform == "win32" else "nvrtc_compile")\n',
     )
-    old = '    compiler = os.environ.get("CXX") or "g++"\n'
-    new = '    compiler = os.environ.get("CXX") or ("cl" if sys.platform == "win32" else "g++")\n'
-    count = path.read_text(encoding="utf-8").count(old)
-    if count != 1:
-        raise RuntimeError(f"{path}: expected one compiler default, found {count}")
-    path.write_text(
-        path.read_text(encoding="utf-8").replace(old, new),
-        encoding="utf-8",
-        newline="",
+    replace_once(
+        path,
+        '    compiler = os.environ.get("CXX") or "g++"\n',
+        '    compiler = os.environ.get("CXX") or '
+        '("cl" if sys.platform == "win32" else "g++")\n',
     )
 
 
@@ -166,7 +170,7 @@ def apply_cubin(path: Path) -> None:
     replace_once(path, "import subprocess\n", "import subprocess\nimport sys\n")
     replace_once(
         path,
-        '''    cmd = [
+        """    cmd = [
         compiler,
         "-O2",
         "-std=c++17",
@@ -176,8 +180,8 @@ def apply_cubin(path: Path) -> None:
         "-o",
         str(tmp_path),
     ]
-''',
-        '''    if sys.platform == "win32":
+""",
+        """    if sys.platform == "win32":
         tmp_path = output_path.with_name(output_path.stem + ".tmp.dll")
         cmd = [
             compiler,
@@ -201,23 +205,28 @@ def apply_cubin(path: Path) -> None:
             "-o",
             str(tmp_path),
         ]
-''',
+""",
     )
     replace_once(
         path,
-        '    native_path = jit_utils.get_precompiled_artifact_path(src_path, "libcubinpatch.so")\n',
-        '    artifact_name = "libcubinpatch.dll" if sys.platform == "win32" else "libcubinpatch.so"\n'
-        '    native_path = jit_utils.get_precompiled_artifact_path(src_path, artifact_name)\n',
+        "    native_path = jit_utils.get_precompiled_artifact_path("
+        'src_path, "libcubinpatch.so")\n',
+        '    artifact_name = "libcubinpatch.dll" if sys.platform == "win32" '
+        'else "libcubinpatch.so"\n'
+        "    native_path = jit_utils.get_precompiled_artifact_path("
+        "src_path, artifact_name)\n",
     )
     replace_once(
         path,
         '    lib_path = build_dir / "libcubinpatch.so"\n',
-        '    lib_path = build_dir / ("libcubinpatch.dll" if sys.platform == "win32" else "libcubinpatch.so")\n',
+        '    lib_path = build_dir / ("libcubinpatch.dll" '
+        'if sys.platform == "win32" else "libcubinpatch.so")\n',
     )
     replace_once(
         path,
         '    compiler = os.environ.get("CXX") or "g++"\n',
-        '    compiler = os.environ.get("CXX") or ("cl" if sys.platform == "win32" else "g++")\n',
+        '    compiler = os.environ.get("CXX") or '
+        '("cl" if sys.platform == "win32" else "g++")\n',
     )
 
 
@@ -225,17 +234,35 @@ def apply_ops(path: Path) -> None:
     replace_once(
         path,
         '        extra_ldflags=["-lcuda", "-lc10_cuda", "-ltorch_cuda"],\n',
-        '        extra_ldflags=(\n'
+        "        extra_ldflags=(\n"
         '            ["cuda.lib", "c10_cuda.lib", "torch_cuda.lib"]\n'
         '            if sys.platform == "win32"\n'
         '            else ["-lcuda", "-lc10_cuda", "-ltorch_cuda"]\n'
-        '        ),\n',
+        "        ),\n",
+    )
+
+
+def apply_compiler(path: Path) -> None:
+    replace_once(path, "import subprocess\n", "import subprocess\nimport sys\n")
+    replace_once(
+        path,
+        """        env = filter_cuda_paths(required_headers=["cuda_runtime.h"])
+        return list(cls.include_dirs()) + list(env["include_paths"])
+""",
+        """        env = filter_cuda_paths(required_headers=["cuda_runtime.h"])
+        include_dirs = list(cls.include_dirs()) + list(env["include_paths"])
+        if sys.platform == "win32":
+            cccl_dir = Path(env["path"]) / "include" / "cccl"
+            if cccl_dir.is_dir():
+                include_dirs.append(str(cccl_dir))
+        return include_dirs
+""",
     )
 
 
 def apply_mapped_file(path: Path) -> None:
     path.write_text(
-        '''#pragma once
+        """#pragma once
 
 #include <cstddef>
 #include <stdexcept>
@@ -340,7 +367,7 @@ private:
   HANDLE mapping_ = nullptr;
 #endif
 };
-''',
+""",
         encoding="utf-8",
         newline="",
     )
@@ -349,8 +376,8 @@ private:
 def apply_nvrtc_cpp(path: Path) -> None:
     replace_once(
         path,
-        '#include <dlfcn.h>\n#include <nvrtc.h>\n',
-        '''#ifdef _WIN32
+        "#include <dlfcn.h>\n#include <nvrtc.h>\n",
+        """#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -359,11 +386,11 @@ def apply_nvrtc_cpp(path: Path) -> None:
 #include <dlfcn.h>
 #endif
 #include <nvrtc.h>
-''',
+""",
     )
     replace_once(
         path,
-        '''template <typename T>
+        """template <typename T>
 void load_symbol(void *library, T &symbol, const char *name) {
   symbol = reinterpret_cast<T>(dlsym(library, name));
   if (symbol == nullptr) die(std::string("cannot load ") + name + ": " + dlerror());
@@ -373,8 +400,8 @@ void load_nvrtc(const std::string &configured_path) {
   void *library = dlopen(configured_path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (library == nullptr)
     die("cannot load NVRTC from " + configured_path + ": " + dlerror());
-''',
-        '''#ifdef _WIN32
+""",
+        """#ifdef _WIN32
 using NativeLibrary = HMODULE;
 #else
 using NativeLibrary = void *;
@@ -395,27 +422,33 @@ void load_nvrtc(const std::string &configured_path) {
 #ifdef _WIN32
   NativeLibrary library = LoadLibraryA(configured_path.c_str());
   if (library == nullptr)
-    die("cannot load NVRTC from " + configured_path + " (error " + std::to_string(GetLastError()) + ")");
+    die("cannot load NVRTC from " + configured_path + " (error " \
++ std::to_string(GetLastError()) + ")");
 #else
   NativeLibrary library = dlopen(configured_path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (library == nullptr)
     die("cannot load NVRTC from " + configured_path + ": " + dlerror());
 #endif
-''',
+""",
     )
 
 
 def apply_exports(path: Path) -> None:
     replace_once(
         path,
-        'extern "C" int cubin_patch(const char *path, const char *mode, int dry, int backup) {\n',
-        '#ifdef _WIN32\n#define HUMMING_EXPORT __declspec(dllexport)\n#else\n#define HUMMING_EXPORT\n#endif\n\n'
-        'extern "C" HUMMING_EXPORT int cubin_patch(const char *path, const char *mode, int dry, int backup) {\n',
+        'extern "C" int cubin_patch(const char *path, const char *mode, '
+        "int dry, int backup) {\n",
+        "#ifdef _WIN32\n#define HUMMING_EXPORT __declspec(dllexport)\n"
+        "#else\n#define HUMMING_EXPORT\n#endif\n\n"
+        'extern "C" HUMMING_EXPORT int cubin_patch(const char *path, '
+        "const char *mode, int dry, int backup) {\n",
     )
     replace_once(
         path,
-        'extern "C" int cubin_patch_buffer(uint8_t *data, size_t n, const char *mode, int dry) {\n',
-        'extern "C" HUMMING_EXPORT int cubin_patch_buffer(uint8_t *data, size_t n, const char *mode, int dry) {\n',
+        'extern "C" int cubin_patch_buffer(uint8_t *data, size_t n, '
+        "const char *mode, int dry) {\n",
+        'extern "C" HUMMING_EXPORT int cubin_patch_buffer(uint8_t *data, '
+        "size_t n, const char *mode, int dry) {\n",
     )
 
 
@@ -431,16 +464,19 @@ def apply(root: Path) -> None:
     apply_device(paths[0])
     apply_nvrtc(paths[1])
     apply_cubin(paths[2])
-    apply_ops(paths[3])
-    apply_mapped_file(paths[4])
-    apply_nvrtc_cpp(paths[5])
-    apply_exports(paths[6])
+    apply_compiler(paths[3])
+    apply_ops(paths[4])
+    apply_mapped_file(paths[5])
+    apply_nvrtc_cpp(paths[6])
+    apply_exports(paths[7])
     print(f"patched humming under {sp}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument(
+        "--repo", type=Path, default=Path(__file__).resolve().parents[2]
+    )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     if not args.apply:

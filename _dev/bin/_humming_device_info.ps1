@@ -11,11 +11,11 @@
 
 [CmdletBinding()]
 param(
-    [string]$Venv = 'D:\code\vllm-windows'
+    [string]$Venv = 'D:\code\vllm-windows\.flashnext-root'
 )
 
 $ErrorActionPreference = 'Stop'
-. D:\code\vllm-windows\_dev\bin\_flashtest_env.ps1 -Repo $Venv
+. D:\code\vllm-windows\_dev\bin\_flashtest_env.ps1 -VenvPath "$Venv\.venv"
 
 $py = "$Venv\.venv\Scripts\python.exe"
 if (-not (Test-Path $py)) { throw "no venv python at $py" }

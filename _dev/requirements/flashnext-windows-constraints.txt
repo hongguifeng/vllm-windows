@@ -1,0 +1,15 @@
+# Tested Windows Flash-Next toolchain; use with requirements/{cuda,windows}.txt.
+# vLLM itself must be built from this checkout, not copied from another venv.
+torch==2.11.0+cu130
+torchaudio==2.11.0+cu130
+torchvision==0.26.0+cu130
+triton-windows==3.6.0.post26
+xformers==0.0.35
+humming-kernels==0.1.15
+flashinfer-python==0.6.11.post3
+transformers==5.18.0
+numpy==2.3.5
+winloop==0.7.0
+setuptools==78.1.0
+cmake==4.4.3
+ninja==1.13.2

@@ -1,4 +1,9 @@
-# _dev —— 本机开发脚手架（不进 git 的本地资产）
+# _dev —— 本机开发脚手架（源码进 Git，产物留本地）
+
+Flash-Next 的环境重建与“删除 venv 不丢修复”说明见
+[FLASHNEXT_REBUILD.md](docs/FLASHNEXT_REBUILD.md)。
+`bin/`、`probe/`、`test/`、`requirements/` 和结论文档是追踪的源码；
+`out/`、虚拟环境、DLL/PYD 和缓存是忽略的生成产物。
 
 这一棵是 2026-09-22 从仓库根收拢进来的：原先 60 多个 `_*` 脚本、8 份自建文档和
 一堆输出目录全摊在根上，和 vLLM 自己的 `CMakeLists.txt` / `setup.py` 混在一起。
@@ -15,7 +20,7 @@
 | `test/` | 功能自测（打已启动的服务） | `_test_longctx.py`、`_test_token_reserve.py`、`_test_tools.py`、`_vision_smoke.py`（448px 小图，验塔能不能跑）、`_vision_pressure.py`（`--px/--count` 发满预算大图，验"跑图后会不会把显存顶过界"；**压视觉必须加 `--unique`**，否则 `--count N` 是同一张图×N，全走 MM 缓存压不到编码器）、`_smoke_batch2.py` |
 | `probe/` | 故障排查 / 复现（一次性实验，大多带 `--apply` / `--undo` 注入） | `_repro_async_tower.ps1`、`_repro_topk_*.py`、`_clamp_exp.py`、`_idcheck_exp.py`、`_patch_draft_eager.py`、`_probe_*.py`、`_selftest_*.py`、`_step_probe.py`、**显存/掉速那一套**：`_paging_watch.ps1`（边发请求边采 `Local/Non Local/Shared` + `dmon -s t`，自动发现引擎 pid）、`_procgpumem.ps1`、`_gpumem_counters.ps1`、`_scan_req.py` / `_scan_step.py`（从日志反推 tok/s 与 ms/步）、`_watch_req.ps1`、`_pcie_scale.py`、`_uva_offload_cache_probe.py`（离线证明卸载的权重副本跑一次 forward 就落进 allocator cache 不再释放；纯 torch，不起服）、`_longctx_vision.py`（**验收探针**：单请求同时吃满长上下文 + 一张满预算图，按 `/tokenize` 精确配额后校验 needle 与图内容双答对）、`_check_serve_defaults.ps1`（**改完 `start_server.ps1` 参数块就跑这个**：ParseFile + 五个 DryRun 探测，核对默认档仍是已验证的 71680/5.8e9/ceil8/release、且 `-MaxGraphCapture` 随 `-MaxSeqs` 派生；每个探测走独立子进程）、`_scan_ctrlchars.py`（扫出文档里"被字符串转义吃掉反斜杠"留下的控制字符——`D:\code\vllm-windows\...` 会变成带 `\v`/`\b` 控制符的隐形坏路径；`--fix` 就地修，跳过 `out/`）、**WSL 侧对照**：`_wsl_wait_ready.sh`（轮询容器 health + 采起服显存曲线）、`_wsl_vision_ab.ps1`（WSL 上跑"纯文本 → 读图 → 纯文本"）、`_mmap_portability_probe.py`（判 `--kv-offloading-size` 能否移植到 Windows：逐项验 `mmap.MAP_SHARED`/`madvise`/映射期 `unlink`/`torch.frombuffer`，5 秒出清单） |
 | `patches/` | 幂等 python 补丁（起服前要跑） | `port_wsl_patches.py`、`fix_winloop_import.py`、`fix_responses_toolcall_none_name.py`、`fix_flashinfer_topk_graph_replay.py`、`fix_offload_release.py`（把 `--cpu-offload-*` 每次 forward 上传的塔副本用完就还给驱动；env 门控，根目录 `start_server.ps1 -ReleaseOffloadCopy` 才生效 —— 不还的话 879 MiB 一进 allocator 就永久占着卡）等；`wsl/` 存 WSL 移植的 .patch |
-| `docs/` | 自建结论文档（非上游 docs） | `AB_WSL_VS_WINDOWS.md`、`RUN_QWEN38_27B_W4A16.md`、`BENCH_170HX_BASELINE.md`、`BENCH_3090.md`、`BUILD_WINDOWS_CMP170HX.md`、`PROBE_STEP_170HX_C1_C2.md`、`WSL_*.md` |
+| `docs/` | 自建结论文档（非上游 docs） | `AB_WSL_VS_WINDOWS.md`、`RUN_QWEN38_27B_W4A16.md`、`BENCH_170HX_BASELINE.md`、`BENCH_3090.md`、`BENCH_FLASHNEXT_GPU1_VS_WSL2_GPU0.md`（Flash-Next 的 Windows/GPU1 vs WSL2/GPU0 对照）、`BUILD_WINDOWS_CMP170HX.md`、`PROBE_STEP_170HX_C1_C2.md`、`WSL_*.md` |
 | `out/` | 一切产物：日志、基准集、A/B 结果 | `logs/serve_<ts>.log`、`_bench_base*/`、`_ab_results/`、`_bench_repro/`、`_aot_dump/` |
 
 ## 常用调用

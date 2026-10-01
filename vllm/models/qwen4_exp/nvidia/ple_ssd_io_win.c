@@ -6,19 +6,13 @@
  * page-aligned read of round_up(row_in_page + row_bytes, 4096), so unaligned rows
  * never need unaligned I/O, and the native call runs without the Python GIL.
  *
- * Requests are tracked with one auto-reset event each and reaped with
- * WaitForMultipleObjects, because associating a file handle with an existing I/O
- * completion port is refused on this machine with ERROR_INVALID_PARAMETER. The
- * reap is pipelined: as soon as one slot frees up it takes the next row, so the
- * queue stays full instead of draining once per batch.
+ * Requests are submitted to one I/O completion port. Unlike
+ * WaitForMultipleObjects, an IOCP can reap more than MAXIMUM_WAIT_OBJECTS
+ * completions, so the requested queue depth is preserved up to the reader's
+ * allocation limit. rows_depth reports the actual depth.
  *
- * WaitForMultipleObjects accepts at most MAXIMUM_WAIT_OBJECTS handles, which caps
- * the queue depth here at 64; the Linux helper's io_depth of 256 is not
- * reproducible with this pattern. rows_depth reports what was actually used.
- *
- * A handle opened with FILE_FLAG_NO_BUFFERING cannot read past the end of the
- * file, so rows whose page crosses EOF are read exactly, buffered, straight into
- * the caller's output. Those are the last rows of the last shard.
+ * Buffered reads are the default. Define PLE_WINDOWS_DIRECT only for A/B tests.
+ * Rows whose page crosses EOF are read exactly, buffered, into the output.
  */
 #include <windows.h>
 
@@ -57,7 +51,7 @@ struct reader {
   unsigned depth;
   unsigned char* buf;
   struct win_req* reqs;
-  HANDLE* events;
+  HANDLE iocp;
   struct bound* bounds;
   int dead;
   unsigned fault_slot;
@@ -87,23 +81,17 @@ __declspec(dllexport) void rows_close(struct reader* r) {
     free(b);
     b = next;
   }
-  if (r->events) {
-    for (unsigned j = 0; j < r->depth; ++j) {
-      if (r->events[j]) CloseHandle(r->events[j]);
-    }
-    free(r->events);
-  }
+  if (r->iocp) CloseHandle(r->iocp);
   if (r->buf) VirtualFree(r->buf, 0, MEM_RELEASE);
   free(r->reqs);
   free(r);
 }
 
 __declspec(dllexport) struct reader* rows_open(unsigned depth) {
-  if (!depth) {
+  if (!depth || depth > 4096) {
     errno = EINVAL;
     return NULL;
   }
-  if (depth > MAXIMUM_WAIT_OBJECTS) depth = MAXIMUM_WAIT_OBJECTS;
   struct reader* r = calloc(1, sizeof(*r));
   if (!r) {
     errno = ENOMEM;
@@ -111,10 +99,15 @@ __declspec(dllexport) struct reader* rows_open(unsigned depth) {
   }
   r->depth = depth;
   r->reqs = calloc(depth, sizeof(*r->reqs));
-  r->events = calloc(depth, sizeof(*r->events));
-  if (!r->reqs || !r->events) {
+  if (!r->reqs) {
     rows_close(r);
     errno = ENOMEM;
+    return NULL;
+  }
+  r->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+  if (!r->iocp) {
+    rows_close(r);
+    errno = (int)GetLastError();
     return NULL;
   }
   /* VirtualAlloc hands back 64 KiB granules, so every slot slice is page aligned
@@ -125,15 +118,6 @@ __declspec(dllexport) struct reader* rows_open(unsigned depth) {
     rows_close(r);
     errno = ENOMEM;
     return NULL;
-  }
-  for (unsigned j = 0; j < depth; ++j) {
-    r->events[j] = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!r->events[j]) {
-      int err = (int)GetLastError();
-      rows_close(r);
-      errno = err;
-      return NULL;
-    }
   }
   return r;
 }
@@ -155,33 +139,58 @@ __declspec(dllexport) int rows_bind(struct reader* r, int fd,
   }
   b->fd = fd;
   DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+#ifdef PLE_WINDOWS_DIRECT
   b->direct = CreateFileW(path, GENERIC_READ, share, NULL, OPEN_EXISTING,
-                          FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS, NULL);
+                          FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS |
+                              FILE_FLAG_OVERLAPPED,
+                          NULL);
   if (b->direct == INVALID_HANDLE_VALUE) {
     int err = (int)GetLastError();
     free(b);
     errno = err;
     return -1000000 - err;
   }
+#else
+  b->direct = NULL;
+#endif
   b->buffered = CreateFileW(path, GENERIC_READ, share, NULL, OPEN_EXISTING,
-                            FILE_FLAG_RANDOM_ACCESS, NULL);
+                            FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OVERLAPPED,
+                            NULL);
   if (b->buffered == INVALID_HANDLE_VALUE) {
     int err = (int)GetLastError();
-    CloseHandle(b->direct);
+    if (b->direct) CloseHandle(b->direct);
     free(b);
     errno = err;
     return -2000000 - err;
   }
   LARGE_INTEGER size;
-  if (!GetFileSizeEx(b->direct, &size)) {
+  HANDLE size_handle = b->direct ? b->direct : b->buffered;
+  if (!GetFileSizeEx(size_handle, &size)) {
     int err = (int)GetLastError();
-    CloseHandle(b->direct);
+    if (b->direct) CloseHandle(b->direct);
     CloseHandle(b->buffered);
     free(b);
     errno = err;
     return -3000000 - err;
   }
   b->size = size.QuadPart;
+  if (b->direct && !CreateIoCompletionPort(b->direct, r->iocp,
+                                             (ULONG_PTR)b, 0)) {
+    int err = (int)GetLastError();
+    CloseHandle(b->direct);
+    CloseHandle(b->buffered);
+    free(b);
+    errno = err;
+    return -4000000 - err;
+  }
+  if (!CreateIoCompletionPort(b->buffered, r->iocp, (ULONG_PTR)b, 0)) {
+    int err = (int)GetLastError();
+    if (b->direct) CloseHandle(b->direct);
+    CloseHandle(b->buffered);
+    free(b);
+    errno = err;
+    return -5000000 - err;
+  }
   b->next = r->bounds;
   r->bounds = b;
   return 0;
@@ -196,10 +205,28 @@ static struct bound* find_bound(struct reader* r, int fd) {
 
 static void kill_reader(struct reader* r) {
   for (struct bound* b = r->bounds; b; b = b->next) {
-    CancelIoEx(b->direct, NULL);
+    if (b->direct) CancelIoEx(b->direct, NULL);
     CancelIoEx(b->buffered, NULL);
   }
-  r->dead = 1;   /* mirrors io_destroy: the helper is unusable afterwards */
+  /* IOCP status is published when the packet is dequeued. Reap cancellation
+   * packets before freeing any request buffers or OVERLAPPED structures. */
+  unsigned pending = 0;
+  for (unsigned slot = 0; slot < r->depth; ++slot) {
+    pending += r->reqs[slot].outstanding != 0;
+  }
+  while (pending) {
+    DWORD got = 0;
+    ULONG_PTR key = 0;
+    OVERLAPPED* ov = NULL;
+    GetQueuedCompletionStatus(r->iocp, &got, &key, &ov, INFINITE);
+    if (!ov) continue;
+    struct win_req* req = (struct win_req*)ov;
+    unsigned slot = (unsigned)(req - r->reqs);
+    if (slot >= r->depth || !req->outstanding) continue;
+    req->outstanding = 0;
+    --pending;
+  }
+  r->dead = 1;   /* the helper is unusable afterwards */
 }
 
 /* Queue one row onto a slot. Returns 1 when queued, 0 with error left in place. */
@@ -215,12 +242,10 @@ static int start_req(struct reader* r, unsigned slot, int fd, uint64_t offset,
   req->b = b;
   req->ordinal = ordinal;
   req->dst = out + (size_t)ordinal * row_bytes;
-  req->ov.hEvent = r->events[slot];
+  req->ov.hEvent = NULL;
   unsigned delta = (unsigned)(offset & (PAGE - 1));
   long long page = (long long)(offset & ~(uint64_t)(PAGE - 1));
-  /* What decides whether we can use the unbuffered handle is the page-rounded
-   * request, not the logical end of the row: a row that ends exactly at the end
-   * of the file can still sit in a page that runs past it. */
+  /* Keep the same page-shaped requests for buffered/direct comparisons. */
   unsigned rounded = (delta + row_bytes + PAGE - 1) & ~(PAGE - 1);
   if (page + (long long)rounded > b->size) {
     /* The page would run past the end of the file, which an unbuffered handle
@@ -245,7 +270,12 @@ static int start_req(struct reader* r, unsigned slot, int fd, uint64_t offset,
   req->need = delta + row_bytes;
   req->ov.Offset = (DWORD)(page & 0xFFFFFFFF);
   req->ov.OffsetHigh = (DWORD)((page >> 32) & 0xFFFFFFFF);
-  if (!ReadFile(b->direct, req->slot, rounded, NULL, &req->ov)) {
+#ifdef PLE_WINDOWS_DIRECT
+  HANDLE read_handle = b->direct;
+#else
+  HANDLE read_handle = b->buffered;
+#endif
+  if (!ReadFile(read_handle, req->slot, rounded, NULL, &req->ov)) {
     int err = (int)GetLastError();
     if (err != ERROR_IO_PENDING) {
       errno = err;
@@ -275,21 +305,24 @@ __declspec(dllexport) int rows_read(struct reader* r, const int* fds,
     ++submitted;
   }
   while (harvested < count && !error) {
-    DWORD w = WaitForMultipleObjects(r->depth, r->events, FALSE, WAIT_MS);
-    if (w == WAIT_TIMEOUT) {
-      error = -ETIMEDOUT;
-      goto failed;
-    }
-    if (w == WAIT_FAILED || w >= WAIT_OBJECT_0 + r->depth) {
-      error = -(int)GetLastError();
-      goto failed;
-    }
-    unsigned slot = (unsigned)(w - WAIT_OBJECT_0);
-    struct win_req* req = &r->reqs[slot];
-    if (!req->outstanding) continue;   /* event fired without a live request */
     DWORD got = 0;
-    HANDLE handle = req->exact ? req->b->buffered : req->b->direct;
-    if (!GetOverlappedResult(handle, &req->ov, &got, FALSE)) {
+    ULONG_PTR key = 0;
+    OVERLAPPED* ov = NULL;
+    BOOL ok = GetQueuedCompletionStatus(r->iocp, &got, &key, &ov, WAIT_MS);
+    if (!ok && !ov) {
+      int err = (int)GetLastError();
+      error = err == WAIT_TIMEOUT ? -ETIMEDOUT : -err;
+      goto failed;
+    }
+    if (!ov) {
+      error = -EIO;
+      goto failed;
+    }
+    struct win_req* req = (struct win_req*)ov;
+    unsigned slot = (unsigned)(req - r->reqs);
+    if (slot >= r->depth || !req->outstanding) continue;
+    req->outstanding = 0;
+    if (!ok) {
       r->fault_slot = slot;
       r->fault_ordinal = req->ordinal;
       r->fault_exact = req->exact;
@@ -312,7 +345,6 @@ __declspec(dllexport) int rows_read(struct reader* r, const int* fds,
       unsigned delta = (unsigned)(offsets[req->ordinal] & (PAGE - 1));
       memcpy(req->dst, req->slot + delta, row_bytes);
     }
-    req->outstanding = 0;
     ++harvested;
     if (submitted < count) {
       if (!start_req(r, slot, fds[submitted], offsets[submitted], row_bytes, out,

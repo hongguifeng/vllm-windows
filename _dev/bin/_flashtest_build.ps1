@@ -10,15 +10,17 @@
 [CmdletBinding()]
 param(
     [string]$Repo = 'D:\code\vllm-windows',
+    [string]$VenvPath = '',
     [switch]$DryRun,
     [switch]$Clean
 )
 
-$ErrorActionPreference = 'Continue'
-$log = 'D:\code\vllm-windows\_dev\out\_flashtest_build.log'
+$ErrorActionPreference = 'Stop'
+$log = Join-Path $Repo '_dev\out\_flashtest_build.log'
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $log) | Out-Null
 function Log($t) { $t | Out-File $log -Append -Encoding utf8 }
 
-. D:\code\vllm-windows\_dev\bin\_flashtest_env.ps1 -Repo $Repo
+. D:\code\vllm-windows\_dev\bin\_flashtest_env.ps1 -Repo $Repo -VenvPath $VenvPath
 
 '=== BUILD START ' + (Get-Date) | Out-File $log -Encoding utf8
 Log "repo = $Repo"
@@ -30,7 +32,8 @@ if ($Clean) {
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-$py = "$Repo\.venv\Scripts\python.exe"
+$venvRoot = if ($VenvPath) { $VenvPath } else { "$Repo\.venv-flashnext" }
+$py = "$venvRoot\Scripts\python.exe"
 if (-not (Test-Path $py)) {
     Log "FATAL: no venv python at $py -- run _flashtest_provision.ps1 first"
     Write-Host "no venv python at $py -- run _flashtest_provision.ps1" -ForegroundColor Red
@@ -57,6 +60,7 @@ if ($DryRun) {
 
 Log '--- uninstall any vllm in this venv ---'
 (& $uv pip uninstall vllm --python $py) *>&1 | Out-File $log -Append -Encoding utf8
+if ($LASTEXITCODE -ne 0) { throw "vLLM uninstall failed; see $log" }
 
 Log '--- uv pip install . --no-build-isolation -v ---'
 $uv = (Get-Command uv -ErrorAction SilentlyContinue).Source

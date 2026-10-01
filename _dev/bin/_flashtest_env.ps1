@@ -9,10 +9,11 @@
 # .venv (which serves the 27B) is never involved.
 
 param(
-    [string]$Repo = 'D:\code\vllm-windows'
+    [string]$Repo = 'D:\code\vllm-windows',
+    [string]$VenvPath = ''
 )
 
-$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Stop'
 
 $MSVC    = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207'
 $SDKROOT = 'C:\Program Files (x86)\Windows Kits\10'
@@ -33,7 +34,8 @@ $env:WindowsSdkBinPath = "$SDKROOT\bin\$SDKVER\"
 $env:INCLUDE = "$MSVC\include;$SDKROOT\Include\$SDKVER\ucrt;$SDKROOT\Include\$SDKVER\shared;$SDKROOT\Include\$SDKVER\um;$SDKROOT\Include\$SDKVER\winrt;$SDKROOT\Include\$SDKVER\cppwinrt"
 $env:LIB     = "$MSVC\lib\x64;$SDKROOT\Lib\$SDKVER\ucrt\x64;$SDKROOT\Lib\$SDKVER\um\x64;$CUDAROOT\lib\x64"
 $env:LIBPATH = "$MSVC\lib\x64"
-$env:PATH    = "$MSVC\bin\Hostx64\x64;$SDKROOT\bin\$SDKVER\x64;$Repo\.venv\Scripts;$CUDAROOT\bin;$env:PATH"
+$venvRoot = if ($VenvPath) { $VenvPath } else { "$Repo\.venv-flashnext" }
+$env:PATH    = "$MSVC\bin\Hostx64\x64;$SDKROOT\bin\$SDKVER\x64;$venvRoot\Scripts;$CUDAROOT\bin;$env:PATH"
 
 $env:DISTUTILS_USE_SDK    = '1'
 $env:VLLM_TARGET_DEVICE   = 'cuda'

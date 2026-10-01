@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Probe how the running server handles tool calls and reasoning.
 
 Sends a request that should trigger a tool call, then reports exactly where the
@@ -8,19 +11,24 @@ Runs two variants because they fail differently on a misconfigured server:
   A) tool_choice="auto"     -- rejected with HTTP 400 unless BOTH
                                --enable-auto-tool-choice and
                                --tool-call-parser are set
-  B) no tool_choice         -- accepted regardless, so the model just answers
-                               and the tool call leaks into `content`
+  B) no tool_choice         -- defaults to "auto" when `tools` are present, so
+                               it hits the same 400 on a server without them
 
-    python _test_tools.py [endpoint]
+    python _test_tools.py [endpoint] [served-model-name]
 """
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
 EP = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000/v1/chat/completions"
-MODEL = "Qwen3.8-27B-W4A16-AutoRound-fast"
+MODEL = (
+    sys.argv[2]
+    if len(sys.argv) > 2
+    else os.environ.get("VLLM_TEST_MODEL", "Qwen3.8-27B-W4A16-AutoRound-fast")
+)
 
 TOOLS = [
     {

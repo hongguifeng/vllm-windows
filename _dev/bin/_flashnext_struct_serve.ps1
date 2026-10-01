@@ -14,6 +14,8 @@
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -WithVision  # keep the vision tower
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -Graphs      # drop --enforce-eager
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -DryRun      # print argv only
+#   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -ThinkingOnDefault  # template default (thinking on)
+#   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -NoTools -NoReasoningParser  # probe arms
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -FullWeights  # the 143 GiB checkpoint
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -FullWeights -PleSsd
 #
@@ -68,6 +70,10 @@ param(
     [switch]$Graphs,
     [switch]$Mtp,
     [int]$MtpTokens = 1,
+    [string]$ToolParser = 'qwen3_xml',
+    [switch]$NoTools,
+    [switch]$NoReasoningParser,
+    [switch]$ThinkingOnDefault,
     [switch]$DryRun
 )
 
@@ -257,6 +263,36 @@ if ($AsyncSched) {
     $argv += '--async-scheduling'
 }
 
+# Tool calling needs BOTH flags. Without them every request carrying `tools`
+# returns HTTP 400 -- including one with no `tool_choice`, which defaults to
+# "auto" (vllm/entrypoints/openai/chat_completion/protocol.py:915).
+#
+# The parser has to match the format the chat template asks for. Qwen3.8 asks
+# for the XML envelope (a tool_call tag wrapping function=NAME and
+# parameter=KEY), not the JSON body `hermes` reads. Picking wrong raises
+# nothing: the call comes back as ordinary `content`, the client sees no
+# `tool_calls`, and it reads as a model problem instead of a server one.
+# qwen3_xml, qwen3_coder and mimo are three aliases for the same parser.
+if (-not $NoTools) {
+    $argv += @('--enable-auto-tool-choice', '--tool-call-parser', $ToolParser)
+}
+# Lifts the thinking block out of `content` into `reasoning` -- vLLM 0.29 names
+# that field `reasoning`, not DeepSeek's `reasoning_content`. With this on and
+# thinking left enabled, probes that read `content` get None: send
+# enable_thinking false per request, or read `reasoning`.
+if (-not $NoReasoningParser) {
+    $argv += @('--reasoning-parser', 'qwen3')
+}
+# Thinking stays off unless a request asks for it. The template treats an
+# undefined enable_thinking as true (chat_template.jinja:46), so without this
+# every request pays a ~40 token reasoning-instruction prompt and the answer
+# lands in `reasoning` instead of `content`. Per-request chat_template_kwargs
+# still win (vllm/renderers/params.py:116-128), so -ThinkingOnDefault only
+# moves the default, it never locks the knob.
+if (-not $ThinkingOnDefault) {
+    $argv += @('--default-chat-template-kwargs', (EscJson '{"enable_thinking": false}'))
+}
+
 Write-Host ''
 Write-Host '==== flash-next structural smoke ====' -ForegroundColor Cyan
 Write-Host ("python : $py")
@@ -267,7 +303,10 @@ Write-Host ("mode   : " + $(if ($Graphs) { 'CUDA graphs' } else { 'enforce-eager
             $(if ($FullWeights) { '  full weights' } else { '  PLE-free view' }) +
             $(if ($PleSsd) { "  + PLE SSD (ask $PleDepth, $PleCacheMb MiB cache, $PleWorkers workers" + $(if ($PlePrefetchTokens -gt 0) { ", prefetch $PlePrefetchTokens" } else { '' }) + ')' } else { '' }) +
             $(if ($Mtp) { "  + MTP x$MtpTokens" } else { '' }) +
-            $(if ($AsyncSched) { '  + async scheduling' } else { '' }))
+            $(if ($AsyncSched) { '  + async scheduling' } else { '' }) +
+            $(if ($NoTools) { '   tools OFF' } else { "  + tools ($ToolParser)" }) +
+            $(if ($NoReasoningParser) { '  no reasoning parser' } else { '  + reasoning qwen3' }) +
+            $(if ($ThinkingOnDefault) { '  thinking on by default' } else { '  thinking off by default' }))
 Write-Host ("limits : $MaxLen ctx, $MaxSeqs seqs, $BatchedTokens batched tokens, util $MemUtil" +
             $(if ($KvGiB -gt 0) { ", KV $KvGiB GiB fixed" } else { '' }) +
             $(if ($LoadStrategy) { ", load $LoadStrategy" } else { '' }))

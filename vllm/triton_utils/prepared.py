@@ -125,9 +125,20 @@ def _strict_check(jit, entry, args: tuple, kwargs: dict) -> bool:
     try:
         reference = _ORIG_RUN(jit, *args, grid=None, warmup=True, **kwargs)
     except Exception:  # pragma: no cover - defensive
-        return True
+        _stats["mismatch"] += 1
+        logger.warning(
+            "prepared launch strict check failed to run Triton's "
+            "dispatch; falling back to it.",
+            exc_info=True,
+        )
+        return False
     if reference is None:
-        return True
+        _stats["mismatch"] += 1
+        logger.warning(
+            "prepared launch strict check got no kernel from "
+            "Triton's dispatch; falling back to it."
+        )
+        return False
     matches = reference is entry.compiled
     if not matches:
         _stats["mismatch"] += 1
@@ -300,8 +311,9 @@ def install_prepared_launch(strict: bool | None = None) -> bool:
                             # Triton's own dispatch picked something else, so let
                             # it launch instead of trusting the cached kernel.
                             _stats["fallback"] += 1
-                            return _ORIG_RUN(self, *args, grid=grid,
-                                             warmup=warmup, **kwargs)
+                            return _ORIG_RUN(
+                                self, *args, grid=grid, warmup=warmup, **kwargs
+                            )
                     return entry.launch(grid, args, kwargs)
         compiled = _ORIG_RUN(self, *args, grid=grid, warmup=warmup, **kwargs)
         _stats["full"] += 1
