@@ -40,7 +40,7 @@ SERVED = os.environ.get("AB_SERVED", "qwen3.8-27b")
 # sides, so the tokenizer is identical either way.
 MODEL_PATH = os.environ.get(
     "AB_MODEL_PATH", r"D:\models\Qwen3.8-27B-W4A16-AutoRound-fast")
-SEED = 1000
+SEED = int(os.environ.get("AB_SEED", "1000"))
 
 
 def num(text, field):

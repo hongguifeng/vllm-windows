@@ -68,6 +68,10 @@ param(
     [switch]$AsyncSched,
     [switch]$WithVision,
     [switch]$Graphs,
+    # Empty (default) lets vLLM derive capture sizes itself. Pass a bracketed
+    # list to reproduce the WSL arm's explicit capture coverage, e.g.
+    #   -CaptureSizes '[1,2,3,...,2048]'
+    [string]$CaptureSizes = '',
     [switch]$Mtp,
     [int]$MtpTokens = 1,
     [string]$ToolParser = 'qwen3_xml',
@@ -203,6 +207,13 @@ if ($WithVision) {
     $argv += @('--limit-mm-per-prompt', (EscJson '{"image":{"count":4}}'))
 }
 if (-not $Graphs) { $argv += '--enforce-eager' }
+if ($CaptureSizes) {
+    # Only the size list differs from the WSL arm; cudagraph_mode already matches
+    # (FULL_AND_PIECEWISE is what the Windows engine resolves today).
+    $argv += @('--compilation-config', (EscJson (
+        '{"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": ' +
+        $CaptureSizes + '}')))
+}
 if ($LoadStrategy) {
     $argv += @('--safetensors-load-strategy', $LoadStrategy)
 }
@@ -296,7 +307,25 @@ if (-not $ThinkingOnDefault) {
 Write-Host ''
 Write-Host '==== flash-next structural smoke ====' -ForegroundColor Cyan
 Write-Host ("python : $py")
-Write-Host ("gpu    : CUDA_VISIBLE_DEVICES=$Gpu  (GPU0 is the WSL container's; 62.1 GiB gone)")
+# Measured, not asserted: which card this run lands on and who is already on it.
+# GPU0 used to belong to the WSL container by convention, but that is a runtime
+# state, not a property of the card, so read it instead of reciting it.
+$gpuLine = "gpu    : CUDA_VISIBLE_DEVICES=$Gpu"
+try {
+    $gcsv = & nvidia-smi --id="$Gpu" --query-gpu=memory.total,memory.used --format=csv,noheader,nounits
+    $gf   = ($gcsv | Select-Object -First 1) -split ','
+    $gpuLine += ("  ({0} GiB used / {1} total, {2} GiB free)" -f
+        [math]::Round([double]$gf[1] / 1024, 1), [math]::Round([double]$gf[0] / 1024, 1),
+        [math]::Round(([double]$gf[0] - [double]$gf[1]) / 1024, 1))
+    $holders = @(nvidia-smi --id="$Gpu" --query-compute-apps=pid --format=csv,noheader)
+    if ($holders) {
+        $gpuLine += "  holders: $($holders -join ', ')"
+        if ($Gpu -ne 0) {
+            $gpuLine += "  (another engine on this card -- they share one NVMe, so never bench both)"
+        }
+    }
+} catch { $gpuLine += '  (nvidia-smi unavailable)' }
+Write-Host $gpuLine
 Write-Host ("model  : $Model")
 Write-Host ("mode   : " + $(if ($Graphs) { 'CUDA graphs' } else { 'enforce-eager' }) +
             $(if ($WithVision) { ' + vision tower' } else { '  (--language-model-only)' }) +

@@ -12,6 +12,9 @@
 #                                            # concurrency, worse for a single stream)
 #   .\start_server.ps1 -Spec none            # no speculative decoding
 #   .\start_server.ps1 -Port 8080
+#   .\start_server.ps1 -Gpu 1             # pin the card; -Gpu '' (default) inherits the
+#                                          # caller's CUDA_VISIBLE_DEVICES, -Gpu '0,1' for TP2.
+#                                          # Stop that same service with: stop_vllm.ps1 -Gpu 1
 #   .\start_server.ps1 -NoAsync              # back to --no-async-scheduling. async is
 #                                            # the default since 2026-09-22 (~10%
 #                                            # faster decode); -Async is kept as an
@@ -112,6 +115,10 @@ param(
     # pynccl ignores is_nccl_available() and dlopens the dll directly.
     # NEVER measured on the 2x CMP 170HX rig; treat as experimental.
     [int]$TP = 1,
+    # Card selection. '' (default) inherits whatever the caller exported, which is
+    # how the 170HX launcher pins a card today; '0'/'1' overrides it, '0,1' exposes
+    # both for -TP 2. Also decides which card the VRAM pre-flight reads.
+    [string]$Gpu = '',
     [int]$BatchedTokens = 2048,
     [double]$MemUtil = 0.93,
     [int]$KeepAlive = 30,
@@ -310,8 +317,20 @@ if ($Force -and -not $DryRun) {
 #                 it saturates rather than growing with the image count)
 #     +~0.4 GiB  the vision encoder's own workspace, same first-image trigger
 # The last two are what turned a 4.2 vs 6.0 GiB pin into 26.6 vs 104.6 ms/step.
+# ------------------------------------------------------- which card? --
+# The VRAM check used to read GPU0 no matter where the service was actually going,
+# so a run pinned to the busy card could pass a check made against the empty one.
+if ($Gpu) { $env:CUDA_VISIBLE_DEVICES = $Gpu }
+$visible = if ($env:CUDA_VISIBLE_DEVICES) {
+    @($env:CUDA_VISIBLE_DEVICES -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+} else { @('0') }
+$checkId = $visible[0]
+if ($TP -gt 1 -and $Gpu -and $visible.Count -lt $TP) {
+    Fail "-Gpu '$Gpu' exposes $($visible.Count) card(s) but -TP $TP needs $TP.`n       Pass a list instead: -Gpu '0,1'."
+}
+
 try {
-    $csv  = & nvidia-smi --query-gpu=memory.total,memory.used --format=csv,noheader,nounits
+    $csv  = & nvidia-smi --id="$checkId" --query-gpu=memory.total,memory.used --format=csv,noheader,nounits
     $f    = ($csv | Select-Object -First 1) -split ','
     $free = [double]$f[0] - [double]$f[1]        # MiB -- nvidia-smi --nounits
     # UNITS (fixed 2026-09-22): $free is MiB while $need below is GiB, and the
@@ -599,6 +618,7 @@ $info = @(
     "  vision copy $(if ($TextOnly) { 'n/a (text only)' } elseif ($NoVisionOffload) { 'tower stays on the card (~0.9 GiB resident)' } elseif ($ReleaseOffloadCopy) { 'released after each encode (default; -ReleaseOffloadCopy:$false to keep it)' } else { 'stays in the allocator -- 0.9 GiB gone for the life of the process' })"
     "  async      $(if ($Async) { 'on (--async-scheduling, default)' } else { 'off (--no-async-scheduling, -NoAsync)' })"
     "  tp         $TP$(if ($TP -gt 1) { '  (EXPERIMENTAL on this rig; V1 multiproc re-enabled)' })"
+    "  gpu        CUDA_VISIBLE_DEVICES=$(if ($env:CUDA_VISIBLE_DEVICES) { $env:CUDA_VISIBLE_DEVICES } else { '(unset -> device 0)' })   VRAM check read card $checkId"
     "  probe      idcheck $idkState   CUDA_LAUNCH_BLOCKING $(if ($env:CUDA_LAUNCH_BLOCKING) { $env:CUDA_LAUNCH_BLOCKING } else { 'off' })   draft CG $(if ($env:DFLASH2_NO_DRAFT_CUDAGRAPH -eq '1') { 'off (eager, diagnostic)' } else { 'on' })   clamp $(if ($env:DFLASH2_CLAMP -eq '1') { 'ON (in-graph guard)' } else { 'off' })"
     "  topk       $(if ($topkImpl -eq 'flashinfer') { 'flashinfer radix (fast, UNSAFE in the drafter graph -- root cause of 2.2c; the context guard is armed)' } else { 'torch.topk (safe; see fix_flashinfer_topk_graph_replay.py)' })"
     "  endpoint   http://127.0.0.1:$Port/v1"

@@ -1,3 +1,15 @@
+# Front door for the Flash-Next service: builds the launcher arguments, starts it
+# detached through _start_vllm_service.ps1, and waits for /health.
+#
+#   & D:\codellm-windows\start_qwen38_flash_next.ps1              # GPU1, :9393
+#   & D:\codellm-windows\start_qwen38_flash_next.ps1 -Gpu 0       # the other card
+#   & ...\start_qwen38_flash_next.ps1 -WithVision -MtpTokens 2      # what :9393 runs today
+#   & ...\start_qwen38_flash_next.ps1 -CaptureSizes '[1,2,3,...,2048]'  # explicit graph coverage
+#
+# One card's service is stopped by D:\codellm-windows\stop_vllm.ps1 -Gpu 0 (or
+# -Gpu 1 / -Port 9393); with no argument it stops both, as before.
+# A service running inside WSL is not visible to that script -- stop it with
+# `wsl.exe -e bash -lc "~/code/qwen3.8-flash-next-cmp170hx/bin/stop.sh --check"`.
 [CmdletBinding()]
 param(
     [string]$Model = 'D:\models\Qwen3.8-Flash-Next-AutoRound-3bpw-MTP',
@@ -54,6 +66,7 @@ $args = @(
     '-FullWeights',
     '-PleSsd'
 )
+if ($CaptureSizes) { $args += @('-CaptureSizes', $CaptureSizes) }
 if (-not $NoGraphs) { $args += '-Graphs' }
 if ($WithVision) { $args += '-WithVision' }
 if (-not $NoMtp) { $args += @('-Mtp', '-MtpTokens', "$MtpTokens") }
