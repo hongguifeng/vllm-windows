@@ -156,3 +156,28 @@ vulnerability process.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+
+## 与 gpt-6 讨论（会诊）：使用场景与方法
+
+### 什么时候该会诊（触发条件）
+
+**该用**：
+
+- 同一个卡点**连续失败 ≥2 次**，或意识到自己开始"猜着试"；
+- 现象自相矛盾、或测量结果**不稳定/复现不了**；
+- 要设计**决定性实验**，或要判断"某假设是否已被否证"；
+- 将要执行**代价高或可能把机器搞坏/搞卡**的操作（重启、驱动级实验、长上下文压测）之前，需要外部评审；
+- 需要一个**判读矩阵**（"若结果 A 则假设 1 成立、若 B 则假设 2"）来决定下一步。
+
+**不该用**：读文档/读源码/跑一条命令就能确认的事；纯查询类问题。
+
+### 2.2 怎么用(仅供参考)
+
+```bash
+cd current path
+nohup timeout 2400 pi --print \
+  --provider lmstudio --model gpt-6-astra \
+  --thinking high --approve \
+  --append-system-prompt "You are a read-only reviewer. Do NOT restart, stop, or reconfigure the running service or the host; no GPU-heavy benchmarks. Answer in English, concretely and quantitatively, ranked by expected value per unit cost." \
+  "$(cat consultations/astra_briefN.md)" > consultations/astra_replyN.md 2> consultations/astra_errN.log &
+```
