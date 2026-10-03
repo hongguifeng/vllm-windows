@@ -183,6 +183,9 @@ extent 后命中了自己的 standby list —— **同一个文件被同一个�
   是第 4 节的落地位置。不需要时 `git worktree remove D:\code\vllm-windows`。
 - `_dev/probe/_flashnext_trim.py`：造“PLE-free 视图”（hardlink + 改 `index.json` /
   `ple_layer_ids: []`），输出到 `D:\models\Qwen3.8-Flash-Next-struct`。
+  视图已于 2026-10-03 删除（删的全是硬链接名字，AR 的 142.56 GiB 数据一字未动，只回收 48.8 MiB 独有元数据）；
+  不可再生的两份 index（227,565 / 227,574 keys）与 compact `config.json` 存档在 `_dev/out/struct_view_meta/`。
+  ⚠ 该脚本只按 `model-00001-of-00011.safetensors` 这个名字跳过 PLE 分片，若 PLE 仍在 rsync 传输中就会被当普通文件链进视图（沿用 rsync 的隐藏临时名），重建视图前先修这里。
 - `_dev/bin/_flashnext_struct_serve.ps1`：烟测专用的起服脚本（GPU1 / eager / `--language-model-only`，
   `-DryRun`、`-Graphs`、`-WithVision`、`-Mtp` 四个开关）。日志到 `_dev/out/logs/flashnext_*.log`。
 - `_dev/test/_flashnext_smoke.py`：`/health` 轮询 + 短/长 prefill + 两路并发。
@@ -270,3 +273,62 @@ ERROR ValueError: Invalid layer_type qwen_sparse_attention
 
 模型代码（qwen4_exp / GDN / QSA / PLE / MTP）不需要移植 —— 它们本来就在 `origin/main` 里，
 升级是把它们**拿过来**，真正要搬的只有上面这 16 处 win32 适配。
+
+---
+
+## 8. 2026-10-03：显存中毒的反事实、视觉默认与 KV/并发饱和（GPU1:9393/9394）
+
+流水见 `.workbuddy/memory/2026-10-03.md`；这一节只留**能反复查阅的结论、数字和回滚路径**。
+
+### 8.1 两种"满了"是两回事（最容易搞错的一条）
+
+| | allocator 中毒 | KV 占用 100% |
+|---|---|---|
+| 看到的信号 | `free` 掉到 1xx MiB 且**不回弹**、短请求 TTFT 3–4 倍、引擎自报 prefill 掉到几百～一千 tok/s | `vllm:kv_cache_usage_perc = 1.0`、`Waiting: N`、`num_preemptions_total` 上升 |
+| 归属 | torch/CUDA caching allocator（cached 块不还给驱动） | scheduler（块不够） |
+| 处理 | `torch.cuda.empty_cache()` 主动回收（本项目做成后台线程） | 引擎自己排队 + 抢占重算，请求结束自动回 0 |
+| 会不会不可恢复 | **会**：空转 90 s 不自愈，继续压会加深（155 → 103 MiB），196K 直接跑不完 | 不会 |
+
+判据用 free + 短请求 TTFT + 引擎自报 prefill 吞吐，**不要用 nvidia-smi 的百分比**：`--gpu-memory-utilization 0.94` 本来就是"把自动 KV 灌到份额顶"，显示 92–98% 是设计如此。
+
+### 8.2 healer：反事实是决定性的
+
+同一端口、同一配置、同一条 131K+图 请求，只换 `-NoAllocHeal`：
+
+| | healer 开 | healer 关 |
+|---|---|---|
+| 该次 prefill | 28.4 s | **50.5 s** |
+| 收尾 free | 1403 MiB（触发 1 次：213 MiB / cached 3045 MiB） | **155 MiB，卡死；空转 90 s 不自愈** |
+| 之后 8K/1-tok ×3 | 1.93 / 1.78 / 1.81 s | **6.65 / 6.55 / 6.54 s**（= 中毒原签名 6.96/7.07/7.05） |
+| 再压 196K | 62.9 s 完成 | **>400 s 未完成**，free → 103 MiB，卡用满 64,621/64,724 MiB |
+| 引擎自报 prefill | 13,000–19,900 tok/s | **818 → 1,636 tok/s** |
+
+实现：`vllm/utils/mem_utils.py::start_alloc_heal_thread()`，由 `vllm/v1/engine/core.py` 在 `init engine (profile, create kv cache, warmup model) took ...` 之后启动（只在 engine core 进程、图捕获之后，避免抢捕获和让 API server 白建 CUDA context）。
+阈值：`QSA_ALLOC_HEAL=1`、`QSA_ALLOC_HEAL_FREE_MB=384`、`QSA_ALLOC_HEAL_CACHED_MB=256`、`QSA_ALLOC_HEAL_COOLDOWN_S=1.0`，150 ms 轮询；语义直接照抄 WSL 侧已验证的那套。启动日志 `[mem_utils.py:75] alloc-heal thread started`，每次回收 `[mem_utils.py:65] alloc-heal fired #N`。
+
+### 8.3 视觉：默认开 + `max_pixels` 上限是必须项
+
+- 本 checkpoint `patch_size=16`、`merge=2` ⇒ factor 32 ⇒ **1 vision token = 32×32 px**；`max_pixels 1310720` ⇒ 上限 ≈**1280 tok/图**。
+- checkpoint 默认 `size.longest_edge = 16777216`（4096×4096）⇒ **16384 tok/图**，而 `--limit-mm-per-prompt {"image":{"count":4}}` 允许 4 张 ⇒ 没有上限时 4 张图能吃掉 65k 上下文。**所以默认开视觉就必须带 max_pixels。**
+- 账（vision + 上限）：weights+非torch 48.28、峰值激活 **0.58**、CUDAGraph 0.17 ⇒ **KV 10.93 GiB = 386,698 tok，262,144 并发 1.48x**，idle free 3213 MiB。
+  开视觉相比纯文本只少 0.81 GiB KV；上限还把 profile 峰值激活从 2.07 GiB 压回 0.58 GiB（无上限那次 KV 只剩 9.45 GiB）。
+- 验收（全部单流 + 4 并发，`/tokenize` 精确配额）：1024px 单图 1024 tok / 0.9 s；3×2048px 压后 prompt 3748 tok（不压 = 12288）且颜色形状全对；4 张 4975 tok 全对；5 张干净拒绝；4 并发带图各 1260 tok、4/4 正确；**满信封 261,972 tok / 57.7 s**；131K 预算 + 4 图 = 129,972 tok / 29 s；196K 两轮 69.10 / 62.85 s（视觉关 63.41/64.19 ⇒ 长上下文无惩罚）。
+- 已知副作用：`Draft model Qwen4ExpMTP does not support external multimodal embeddings` —— 带图请求的 MTP 草稿只吃文本，投机收益打折；正确性不受影响。
+- 开关：外层 `start_qwen38_flash_next.ps1` 默认开视觉，`-NoVision` 回纯文本，`-MaxPixels 0` 放开到 checkpoint 上限。**内层 `_flashnext_struct_serve.ps1` 与测量臂（`_serve_bg.ps1`）默认仍是纯文本**，历史 benchmark 口径没变。
+
+### 8.4 并发与 KV：这版引擎把 prefill 串行化
+
+- 4 条并发长 prefill **灌不满 KV**：4×95,200 → usage 峰值 0.368；4×130,300（超容量 1.36x）→ 0.451；抢占 0；TTFT 阶梯 21.6/41.7/61.7/80.6 s。原因是 `--max-num-batched-tokens 2048`（MTP 还把 `max_num_scheduled_tokens` 压到 2048）使同时只驻留 1–2 条。
+- 要真占满必须**用 `min_tokens` 把块占住**（模型默认答 8 个 token 就 EOS 立刻释放）：2×191,200 + `min_tokens 6500` → usage **1.000**、抢占 +2、中途 canary 1.9 s → 54.9 s；再挤一条 130,000（需求 1.33x）→ usage 仍 1.000、抢占 +2、canary 98.0 s；带图 2×190,055 → usage 1.000、抢占 +3、带图 canary 67.2 s 仍正确、healer 零触发。
+- 多轮：prompt 59,331→119,664→179,999→181,041，延迟 32.6→34.1→35.6→**85.3 s**；**最后一轮只加 28 tok 也要 85 s = 整段历史重算**；`Prefix cache hit rate` 仅 **4.5–8.8%**（健康多轮应 90%+）。**"多轮越打越慢"是前缀缓存在这个 hybrid 模型上不生效，与显存无关**；下一步该查 `--mamba-cache-mode align` × `enable_prefix_caching=True`。
+
+### 8.5 防重入（因为真的撑爆过一次）
+
+`_start_vllm_service.ps1` 在 `Start-Process` **之前**检查：①目标端口有 TCP 监听 → 拒绝；②`-GuardGpu` 那张卡 `memory.used ≥ 4096 MiB` → 拒绝并列 compute-app pid（列不出来说明持有者可能在 WSL）。命中即什么都不启动；`-SkipGuard` 逃生。`start_qwen38_27b.ps1` 走同一个 wrapper，自动受保护；`_dev/bin/_serve_bg.ps1` 自己 `Start-Process`，**还没有保护**。
+事故复盘：07:47:39 GPU1 上已有 engine 在加载（**端口未绑，`/health` 探不到**），07:53:36 我又起了第二个 → 一张卡两个 engine。**起服前必须读 nvidia-smi，不能用 /health 判断有没有人在跑。**
+
+### 8.6 回滚
+
+- 撤 healer：`git checkout vllm/utils/mem_utils.py vllm/v1/engine/core.py`，或把 `_dev/out/installed_backups/alloc_heal/*.orig` 拷回 `.venv-flashnext/Lib/site-packages/vllm/`，然后重启。
+- 撤视觉默认：起服时传 `-NoVision`（代码默认是开）。
+- ⚠ **服务跑的是安装树**（`.flashnext-root/.venv/Lib/site-packages/vllm` 是 junction → `.venv-flashnext/Lib/site-packages/vllm`），不是仓库 `vllm/`。改完仓库文件必须拷进安装树；**重装/重建 vllm 后这两份要重新拷**。

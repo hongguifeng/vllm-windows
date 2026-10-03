@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import gc
+import os
+import threading
 import time
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -17,6 +19,65 @@ from vllm.platforms import current_platform
 from .mem_constants import GiB_bytes, KiB_bytes, MiB_bytes
 
 logger = init_logger(__name__)
+
+
+def start_alloc_heal_thread() -> None:
+    """Return unused cached allocator blocks once free device memory runs low.
+
+    Long-context scratch buffers stay cached after a request finishes, so free
+    memory settles at a few hundred MiB and later allocations are served by
+    host paging (a persistent multi-times slowdown). Under WSL this is handled
+    by the same healer in ``qsa.py``; call this from the engine process only,
+    after warmup and CUDA graph capture, so it never races a capture.
+
+    Enabled by ``QSA_ALLOC_HEAL=1``.
+    """
+    if os.environ.get("QSA_ALLOC_HEAL", "0") != "1":
+        return
+
+    free_limit = int(float(os.environ.get("QSA_ALLOC_HEAL_FREE_MB", "384")) * MiB_bytes)
+    cached_limit = int(
+        float(os.environ.get("QSA_ALLOC_HEAL_CACHED_MB", "256")) * MiB_bytes
+    )
+    cooldown = float(os.environ.get("QSA_ALLOC_HEAL_COOLDOWN_S", "1.0"))
+    device = torch.device(current_platform.current_device())
+    fired = 0
+    last = 0.0
+
+    def run() -> None:
+        nonlocal fired, last
+        while True:
+            time.sleep(0.15)
+            try:
+                free_memory, _ = torch.accelerator.get_memory_info(device)
+                reserved = torch.accelerator.memory_reserved(device)
+                cached = reserved - torch.accelerator.memory_allocated(device)
+                now = time.monotonic()
+                if (
+                    free_memory < free_limit
+                    and cached > cached_limit
+                    and now - last >= cooldown
+                ):
+                    torch.accelerator.empty_cache()
+                    fired += 1
+                    last = now
+                    if fired <= 20 or fired % 50 == 0:
+                        logger.warning(
+                            "alloc-heal fired #%d: free=%.0fMiB cached=%.0fMiB",
+                            fired,
+                            free_memory / MiB_bytes,
+                            cached / MiB_bytes,
+                        )
+            except Exception:  # noqa: BLE001
+                pass
+
+    threading.Thread(target=run, name="alloc-heal", daemon=True).start()
+    logger.info(
+        "alloc-heal thread started (free<%.0fMiB cached>%.0fMiB cooldown=%.1fs)",
+        free_limit / MiB_bytes,
+        cached_limit / MiB_bytes,
+        cooldown,
+    )
 
 
 def format_kib(b: int) -> str:

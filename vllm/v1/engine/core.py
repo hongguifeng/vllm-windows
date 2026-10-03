@@ -42,6 +42,7 @@ from vllm.utils.gc_utils import (
     maybe_attach_gc_debug_callback,
 )
 from vllm.utils.hashing import get_hash_fn_by_name
+from vllm.utils.mem_utils import start_alloc_heal_thread
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
@@ -399,6 +400,8 @@ class EngineCore:
                 "init engine (profile, create kv cache, warmup model) took %.2f s",
                 elapsed,
             )
+        # Warmup and graph capture are done, so reclaiming cached blocks is safe.
+        start_alloc_heal_thread()
         return scheduler_kv_cache_config
 
     def _initialize_effective_attention_block_size(self) -> None:

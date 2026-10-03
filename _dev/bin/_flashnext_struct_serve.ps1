@@ -11,7 +11,8 @@
 # every campaign launch so far went through here.
 #
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1              # GPU1, LM only, eager
-#   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -WithVision  # keep the vision tower
+#   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -WithVision  # vision tower + max_pixels cap
+#   & ...\_flashnext_struct_serve.ps1 -WithVision -MaxPixels 0               # uncapped images
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -Graphs      # drop --enforce-eager
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -DryRun      # print argv only
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -ThinkingOnDefault  # template default (thinking on)
@@ -66,7 +67,9 @@ param(
     [int]$ProfilerActiveIterations = 30,
     [switch]$NSys,
     [switch]$AsyncSched,
-    [switch]$WithVision,
+    [switch]$WithVision,      # vision tower instead of --language-model-only
+    [int]$MaxPixels = 1310720,
+    [switch]$NoAllocHeal,
     [switch]$Graphs,
     # Empty (default) lets vLLM derive capture sizes itself. Pass a bracketed
     # list to reproduce the WSL arm's explicit capture coverage, e.g.
@@ -141,6 +144,18 @@ $env:VLLM_ENABLE_V1_MULTIPROCESSING = '0'
 $env:VLLM_USE_FLASHINFER_SAMPLER    = '0'
 $env:HF_HUB_DISABLE_SYMLINKS_WARNING = '1'
 $env:PYTHONUNBUFFERED = '1'
+# Long-context scratch buffers stay cached after a request finishes, so free
+# VRAM settles near zero and later allocations are served by host paging -- the
+# state in which 8K prefill grows from 2 s to 7 s and only a restart helps.
+# WSL runs this healer; hand it the same thresholds here.
+if ($NoAllocHeal) {
+    $env:QSA_ALLOC_HEAL = '0'
+} else {
+    $env:QSA_ALLOC_HEAL = '1'
+    if (-not $env:QSA_ALLOC_HEAL_FREE_MB) { $env:QSA_ALLOC_HEAL_FREE_MB = '384' }
+    if (-not $env:QSA_ALLOC_HEAL_CACHED_MB) { $env:QSA_ALLOC_HEAL_CACHED_MB = '256' }
+    if (-not $env:QSA_ALLOC_HEAL_COOLDOWN_S) { $env:QSA_ALLOC_HEAL_COOLDOWN_S = '1.0' }
+}
 if ($OmpThreads -gt 0) {
     $env:OMP_NUM_THREADS = "$OmpThreads"
     # The reference engine pins both; leaving MKL free lets BLAS spawn a second
@@ -205,6 +220,12 @@ if ($WithVision) {
     # --language-model-only was appended above; drop it by rebuilding argv.
     $argv = $argv | Where-Object { $_ -ne '--language-model-only' }
     $argv += @('--limit-mm-per-prompt', (EscJson '{"image":{"count":4}}'))
+    # One token is 32x32 px (patch 16 x merge 2), so max_pixels 1310720 caps an
+    # image at 1280 tokens. Without it the checkpoint allows 4096x4096, i.e.
+    # 16384 tokens per image, and 4 images could eat a 65k context.
+    if ($MaxPixels -gt 0) {
+        $argv += @('--mm-processor-kwargs', (EscJson ('{"max_pixels": ' + $MaxPixels + '}')))
+    }
 }
 if (-not $Graphs) { $argv += '--enforce-eager' }
 if ($CaptureSizes) {
@@ -328,7 +349,10 @@ try {
 Write-Host $gpuLine
 Write-Host ("model  : $Model")
 Write-Host ("mode   : " + $(if ($Graphs) { 'CUDA graphs' } else { 'enforce-eager' }) +
-            $(if ($WithVision) { ' + vision tower' } else { '  (--language-model-only)' }) +
+            $(if ($WithVision) {
+                if ($MaxPixels -gt 0) { " + vision tower  max_pixels=$MaxPixels (~$([math]::Floor($MaxPixels/1024)) tok/image)" }
+                else { ' + vision tower  max_pixels=checkpoint (~16384 tok/image)' }
+            } else { '  (--language-model-only)' }) +
             $(if ($FullWeights) { '  full weights' } else { '  PLE-free view' }) +
             $(if ($PleSsd) { "  + PLE SSD (ask $PleDepth, $PleCacheMb MiB cache, $PleWorkers workers" + $(if ($PlePrefetchTokens -gt 0) { ", prefetch $PlePrefetchTokens" } else { '' }) + ')' } else { '' }) +
             $(if ($Mtp) { "  + MTP x$MtpTokens" } else { '' }) +
@@ -338,7 +362,8 @@ Write-Host ("mode   : " + $(if ($Graphs) { 'CUDA graphs' } else { 'enforce-eager
             $(if ($ThinkingOnDefault) { '  thinking on by default' } else { '  thinking off by default' }))
 Write-Host ("limits : $MaxLen ctx, $MaxSeqs seqs, $BatchedTokens batched tokens, util $MemUtil" +
             $(if ($KvGiB -gt 0) { ", KV $KvGiB GiB fixed" } else { '' }) +
-            $(if ($LoadStrategy) { ", load $LoadStrategy" } else { '' }))
+            $(if ($LoadStrategy) { ", load $LoadStrategy" } else { '' }) +
+            $(if ($NoAllocHeal) { ', alloc-heal OFF' } else { ", alloc-heal free<$($env:QSA_ALLOC_HEAL_FREE_MB)MiB cached>$($env:QSA_ALLOC_HEAL_CACHED_MB)MiB" }))
 Write-Host ("log    : $log")
 Write-Host ''
 

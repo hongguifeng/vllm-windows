@@ -8,7 +8,11 @@ param(
     [int]$Port,
     [string]$Model = '',
     [int]$TimeoutSec = 1800,
-    [string[]]$ServerArgs = @()
+    [string[]]$ServerArgs = @(),
+    # Re-entry guard. -1 skips the card check; the port check always runs.
+    [int]$GuardGpu = -1,
+    [int]$GuardUsedMiB = 4096,
+    [switch]$SkipGuard
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +22,49 @@ New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
 if (-not (Test-Path -LiteralPath $ServerScript)) {
     throw "server script not found: $ServerScript"
+}
+
+# Two engines on one card blow the VRAM budget -- the second one cannot allocate
+# and usually takes the first one down with it. Check before launching, never after.
+function Test-PortListening([int]$p) {
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $client.Connect('127.0.0.1', $p)
+        $ok = $client.Connected
+        $client.Close()
+        return $ok
+    } catch {
+        return $false
+    }
+}
+
+if (-not $SkipGuard) {
+    if (Test-PortListening $Port) {
+        Write-Host "ERROR: 127.0.0.1:$Port already has a listener -- a service is up." -ForegroundColor Red
+        Write-Host "Stop it first, then start again:" -ForegroundColor Yellow
+        Write-Host "  & D:\code\vllm-windows\stop_vllm.ps1 -Port $Port" -ForegroundColor Yellow
+        Write-Host 'Nothing was launched. (-SkipGuard to start anyway.)' -ForegroundColor DarkGray
+        exit 1
+    }
+    if ($GuardGpu -ge 0) {
+        $raw = & nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i $GuardGpu 2>$null
+        $used = 0
+        if ($raw) { [void][int]::TryParse(($raw -replace '\D', ''), [ref]$used) }
+        $uuid = (& nvidia-smi --query-gpu=gpu_uuid --format=csv,noheader -i $GuardGpu 2>$null)
+        $apps = @(& nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader 2>$null |
+            Where-Object { $_ -like "$uuid,*" })
+        if ($used -ge $GuardUsedMiB) {
+            Write-Host "ERROR: GPU $GuardGpu already holds $used MiB -- another engine is on that card." -ForegroundColor Red
+            if ($apps.Count) {
+                Write-Host "compute apps: $($apps -join '; ')" -ForegroundColor Yellow
+                Write-Host "stop by pid : $(& { ($apps | ForEach-Object { ($_ -split ',')[1] }) -join ' ' })" -ForegroundColor Yellow
+            } else {
+                Write-Host 'no Windows compute app listed -- the holder may live inside WSL.' -ForegroundColor Yellow
+            }
+            Write-Host "Nothing was launched. (-SkipGuard to start anyway.)" -ForegroundColor DarkGray
+            exit 1
+        }
+    }
 }
 
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
