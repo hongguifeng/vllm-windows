@@ -13,6 +13,8 @@
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1              # GPU1, LM only, eager
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -WithVision  # vision tower + max_pixels cap
 #   & ...\_flashnext_struct_serve.ps1 -WithVision -MaxPixels 0               # uncapped images
+#   & ...\_flashnext_struct_serve.ps1 -WithVision -MaxImages 0               # no per-prompt image cap
+#   & ...\_flashnext_struct_serve.ps1 -WithVision -MaxImages 8               # cap at 8 images per request
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -Graphs      # drop --enforce-eager
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -DryRun      # print argv only
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -ThinkingOnDefault  # template default (thinking on)
@@ -69,6 +71,9 @@ param(
     [switch]$AsyncSched,
     [switch]$WithVision,      # vision tower instead of --language-model-only
     [int]$MaxPixels = 1310720,
+    # 0 (default) = no per-prompt image cap beyond the context window; a
+    # positive value caps how many images one request may carry.
+    [int]$MaxImages = 0,
     [switch]$NoAllocHeal,
     [switch]$Graphs,
     # Empty (default) lets vLLM derive capture sizes itself. Pass a bracketed
@@ -219,10 +224,13 @@ $argv = @(
 if ($WithVision) {
     # --language-model-only was appended above; drop it by rebuilding argv.
     $argv = $argv | Where-Object { $_ -ne '--language-model-only' }
-    $argv += @('--limit-mm-per-prompt', (EscJson '{"image":{"count":4}}'))
+    # -MaxImages 0 leaves the cap at vLLM's own default (999), so the context
+    # window is the only thing that binds; a positive value sets the cap.
+    $imageCap = if ($MaxImages -gt 0) { $MaxImages } else { 999 }
+    $argv += @('--limit-mm-per-prompt', (EscJson ('{"image":{"count":' + $imageCap + '}}')))
     # One token is 32x32 px (patch 16 x merge 2), so max_pixels 1310720 caps an
     # image at 1280 tokens. Without it the checkpoint allows 4096x4096, i.e.
-    # 16384 tokens per image, and 4 images could eat a 65k context.
+    # 16384 tokens per image, so an uncapped request could eat the whole context.
     if ($MaxPixels -gt 0) {
         $argv += @('--mm-processor-kwargs', (EscJson ('{"max_pixels": ' + $MaxPixels + '}')))
     }
@@ -353,6 +361,9 @@ Write-Host ("mode   : " + $(if ($Graphs) { 'CUDA graphs' } else { 'enforce-eager
                 if ($MaxPixels -gt 0) { " + vision tower  max_pixels=$MaxPixels (~$([math]::Floor($MaxPixels/1024)) tok/image)" }
                 else { ' + vision tower  max_pixels=checkpoint (~16384 tok/image)' }
             } else { '  (--language-model-only)' }) +
+            $(if ($WithVision) {
+                if ($MaxImages -gt 0) { "  images<=${MaxImages}/prompt" } else { '  images unlimited (context-bound)' }
+            } else { '' }) +
             $(if ($FullWeights) { '  full weights' } else { '  PLE-free view' }) +
             $(if ($PleSsd) { "  + PLE SSD (ask $PleDepth, $PleCacheMb MiB cache, $PleWorkers workers" + $(if ($PlePrefetchTokens -gt 0) { ", prefetch $PlePrefetchTokens" } else { '' }) + ')' } else { '' }) +
             $(if ($Mtp) { "  + MTP x$MtpTokens" } else { '' }) +

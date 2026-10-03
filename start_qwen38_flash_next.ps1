@@ -6,6 +6,8 @@
 #   & D:\code\vllm-windows\start_qwen38_flash_next.ps1 -Unc         # load the Uncensored AutoRound build
 #   & ...\start_qwen38_flash_next.ps1 -NoVision -MtpTokens 2        # text-only arm
 #   & ...\start_qwen38_flash_next.ps1 -MaxPixels 0                  # uncapped images
+#   & ...\start_qwen38_flash_next.ps1 -MaxImages 0                   # no image-count cap (default)
+#   & ...\start_qwen38_flash_next.ps1 -MaxImages 8                   # cap at 8 images per request
 # Vision is ON by default: the tower takes ~2.3 GiB out of the auto KV budget, which
 # leaves MORE VRAM free than letting KV fill the whole 0.94 ceiling.
 #   & ...\start_qwen38_flash_next.ps1 -CaptureSizes '[1,2,3,...,2048]'  # explicit graph coverage
@@ -36,6 +38,8 @@ param(
     [string]$Venv = 'D:\code\vllm-windows\.flashnext-root',
     [switch]$NoVision,
     [int]$MaxPixels = 1310720,
+    # 0 (default) = no per-prompt image cap; the context window is the only limit.
+    [int]$MaxImages = 0,
     [switch]$NoAllocHeal,
     [switch]$NoMtp,
     [switch]$NoGraphs,
@@ -97,6 +101,7 @@ if ($DryRun) { $args += '-DryRun' }
 # default (that is what the measurement arms use).
 if (-not $NoVision) { $args += '-WithVision' }
 $args += @('-MaxPixels', "$MaxPixels")
+$args += @('-MaxImages', "$MaxImages")
 if (-not $NoMtp) { $args += @('-Mtp', '-MtpTokens', "$MtpTokens") }
 if ($Async -and -not $NoAsync) { $args += '-AsyncSched' }
 if ($NoTools) { $args += '-NoTools' }
