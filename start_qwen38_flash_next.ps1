@@ -3,6 +3,7 @@
 #
 #   & D:\code\vllm-windows\start_qwen38_flash_next.ps1              # GPU1, :9393
 #   & D:\code\vllm-windows\start_qwen38_flash_next.ps1 -Gpu 0       # the other card
+#   & D:\code\vllm-windows\start_qwen38_flash_next.ps1 -Unc         # load the Uncensored AutoRound build
 #   & ...\start_qwen38_flash_next.ps1 -NoVision -MtpTokens 2        # text-only arm
 #   & ...\start_qwen38_flash_next.ps1 -MaxPixels 0                  # uncapped images
 # Vision is ON by default: the tower takes ~2.3 GiB out of the auto KV budget, which
@@ -16,7 +17,7 @@
 [CmdletBinding()]
 param(
     [string]$Model = 'D:\models\Qwen3.8-Flash-Next-AutoRound-3bpw-MTP',
-    [string]$ServedName = 'qwen3.8-flash-next-win',
+    [string]$ServedName = 'Qwen3.8-Flash-Next',
     [int]$Port = 9393,
     [int]$Gpu = 1,
     [int]$MaxLen = 262144,
@@ -46,12 +47,24 @@ param(
     [string]$ToolParser = 'qwen3_xml',
     [switch]$NoTools,
     [switch]$NoReasoningParser,
-    [switch]$ThinkingOnDefault
+    [switch]$ThinkingOnDefault,
+    # Swaps the default checkpoint to the AutoRound Uncensored build; an explicit
+    # -Model/-ServedName still overrides it.
+    [switch]$Unc
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = 'D:\code\vllm-windows'
 $launcher = "$repo\_dev\bin\_flashnext_struct_serve.ps1"
+
+# -Unc swaps the default checkpoint to the AutoRound Uncensored build and
+# gives it a distinct served name so clients can tell it apart from the censored
+# default. An explicitly passed -Model/-ServedName always wins.
+if ($Unc) {
+    if (-not $PSBoundParameters.ContainsKey('Model')) {
+        $Model = 'D:\models\Qwen3.8-Flash-Next-Uncensored-AutoRound-3bpw-MTP'
+    }
+}
 
 if (-not (Test-Path -LiteralPath "$Model\config.json")) {
     Write-Host "ERROR: model config not found: $Model\config.json" -ForegroundColor Red
@@ -105,6 +118,7 @@ if ($DryRun) {
     -Name 'qwen38-flash-next-win' `
     -Port $Port `
     -Model $Model `
+    -ServedModel $ServedName `
     -TimeoutSec $TimeoutSec `
     -GuardGpu $Gpu `
     -SkipGuard:$SkipGuard `

@@ -7,6 +7,9 @@ param(
     [Parameter(Mandatory = $true)]
     [int]$Port,
     [string]$Model = '',
+    # The id clients must send in the OpenAI request body (--served-model-name).
+    # Printed alongside the checkpoint path so the two are not confused.
+    [string]$ServedModel = '',
     [int]$TimeoutSec = 1800,
     [string[]]$ServerArgs = @(),
     # Re-entry guard. -1 skips the card check; the port check always runs.
@@ -72,8 +75,9 @@ $stdoutLog = "$logDir\${Name}_${stamp}.stdout.log"
 $stderrLog = "$logDir\${Name}_${stamp}.stderr.log"
 
 Write-Host "=== starting $Name ===" -ForegroundColor Cyan
-if ($Model) { Write-Host "model : $Model" }
-Write-Host "port  : $Port"
+if ($Model) { Write-Host "model  : $Model" }
+if ($ServedModel) { Write-Host "served : $ServedModel" }
+Write-Host "port   : $Port"
 Write-Host "logs  : $stdoutLog"
 Write-Host "        $stderrLog"
 Write-Host ''
@@ -94,6 +98,16 @@ $stdoutOffset = 0L
 $stderrOffset = 0L
 $started = Get-Date
 $healthUri = "http://127.0.0.1:$Port/health"
+
+function Get-ServedModelIds([int]$p) {
+    try {
+        $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$p/v1/models" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        $data = ($resp.Content | ConvertFrom-Json).data
+        return @($data | ForEach-Object { $_.id } | Where-Object { $_ })
+    } catch {
+        return @()
+    }
+}
 
 function Show-LogDelta([string]$Path, [long]$Offset, [string]$Label) {
     if (-not (Test-Path -LiteralPath $Path)) { return $Offset }
@@ -126,6 +140,11 @@ while (((Get-Date) - $started).TotalSeconds -lt $TimeoutSec) {
             Write-Host "health  : $healthUri"
             Write-Host "metrics : http://127.0.0.1:$Port/metrics"
             if ($Model) { Write-Host "model   : $Model" }
+            # Ask the running server what it actually serves; that id is what the
+            # request body must name, and it beats guessing from -ServedModel.
+            $served = Get-ServedModelIds -Port $Port
+            if ($served) { Write-Host "served  : $($served -join ', ')" -ForegroundColor Yellow }
+            elseif ($ServedModel) { Write-Host "served  : $ServedModel" }
             Write-Host "stdout  : $stdoutLog"
             Write-Host "stderr  : $stderrLog"
             Write-Host 'stop    : D:\code\vllm-windows\stop_vllm.ps1'
