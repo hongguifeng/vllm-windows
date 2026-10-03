@@ -42,7 +42,7 @@ param(
     [int]$MaxLen = 4096,
     [int]$MaxSeqs = 4,
     [int]$BatchedTokens = 2048,
-    [double]$MemUtil = 0.90,
+    [double]$MemUtil = 0.96,
     [string]$LoadStrategy = '',
     [long]$KvGiB = 0,
     [switch]$FullWeights,

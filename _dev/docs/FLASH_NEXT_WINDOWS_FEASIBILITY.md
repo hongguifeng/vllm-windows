@@ -369,8 +369,11 @@ desired GPU memory utilization (0.98, 62.34 GiB).`
 
 **服务默认改为 0.96**（`start_qwen38_flash_next.ps1`）：0.96 相对 0.94 在速度上分辨不出，
 却多出 11.6% 的 KV 容量，且仍留 1.9 GiB 空闲余量；0.97 只在确实需要多 66k tokens 时开，
-且 healer 必须开。测量臂（`_dev/bin/_serve_bg.ps1`）仍钉 0.94，结构 probe 内部默认仍是 0.90，
-以保有历史可比性。
+且 healer 必须开。内层 `_dev/bin/_flashnext_struct_serve.ps1` 的默认也跟着改成 0.96，
+因为 `_serve_bg.ps1` 根本不传 `-MemUtil`——测量臂因此与服务共用同一上限（旧日志里只剩
+两份还带着 0.94，可比性损失很小）。**没跟着改的 0.9x 都属于别的模型**：`_dev/bench/_ab_serve_win.sh`
+与 `_bench_27b.py` 是 27B-W4A16 那套（max-len 60,928、KV 钉死 6 GiB、激活余量不同），
+`_dev/bin/_run.ps1` 按**空闲**显存推导比例（必须适配 free 而非总量），上游 CI 脚本仍是 0.9。
 
 另：手设 `-KvGiB` 不要超过 **12.8 GiB**，它绕过同一套上限校验，只会更早撞墙。
 
