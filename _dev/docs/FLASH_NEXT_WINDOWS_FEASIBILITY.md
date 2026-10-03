@@ -331,4 +331,47 @@ ERROR ValueError: Invalid layer_type qwen_sparse_attention
 
 - 撤 healer：`git checkout vllm/utils/mem_utils.py vllm/v1/engine/core.py`，或把 `_dev/out/installed_backups/alloc_heal/*.orig` 拷回 `.venv-flashnext/Lib/site-packages/vllm/`，然后重启。
 - 撤视觉默认：起服时传 `-NoVision`（代码默认是开）。
+
+### 8.7 MemUtil 扫描：KV 最多加到哪一档（2026-10-03，GPU1:9394，vision 默认 +
+max_pixels=1310720，MTP x2，每档全新启动）
+
+| 档位 | KV | KV tokens | 并发@262K | 空闲 free | 8K 基线 | 196K TTFT | 196K 后 8K | heal 次数 | 最低 free |
+|-------|------|-----------|-----------|-----------|----------|-----------|------------|-----------|-----------|
+| 0.94 | 10.93 GiB | 386,698 | 1.48x | 3,213 MiB | 1.94–2.31 s | 62.9 / 69.1 / 74.9 s | 1.78–2.03 s | 18 | 111 MiB |
+| 0.96 | 12.20 GiB | 431,596 | 1.65x | 1,913 MiB | 2.08–2.32 s | 70.1 s | 1.98–2.26 s | 20 | 105 MiB |
+| 0.97 | 12.84 GiB | 453,320 | 1.73x | 1,285 MiB | 2.20–2.41 s | 75.8 s | 1.84–2.33 s | 23 | **0 MiB**（瞬时） |
+| 0.98 | 起不来 | — | — | — | — | — | — | — | — |
+
+0.98 的报错原文（启动阶段就被拒，不是中毒）：
+`ValueError: Free memory on device cuda:0 (62.21/63.61 GiB) on startup is less than
+desired GPU memory utilization (0.98, 62.34 GiB).`
+即硬上限 = 62.21 / 63.61 = **0.978**，**0.97 是能起来的最后一档**。
+换算：每 +0.01 ≈ +0.64 GiB ≈ +22.6k tokens（+5% 容量）。
+
+结论三条：
+
+1. **中毒不由 KV 大小决定，由缓存块能否归还决定**。无 healer 时 0.94 已经实测中毒
+   （8K 6.5–6.8 s、196K >400 s 跑不完）；有 healer 时 0.94 / 0.96 / 0.97 都不中毒
+   （事后 8K 全部回到 1.8–2.4 s）。所以"加到多少会中毒"在无 healer 的世界里是
+   "任何一档都会"，在有 healer 的世界里是"到分配器再也还不出东西为止"。
+2. **往上加是拿余量换容量，0.96 花的不是速度是余量**：空闲 free 3,213 → 1,913 MiB，
+   heal 强度 18（最低 111 MiB）→ 20（最低 105 MiB），换来 +44,898 tok（+11.6%，
+   并发 1.48x → 1.65x）。而 0.94 自己三次启动的 196K 相差 12 s（19% 跨度），比
+   0.96 与 0.94 之差还大——**当前分辨率分不出 0.96 变慢**；超出噪声的是 0.97
+   （75.8 s 顶到 0.94 最差端、262K 期间 canary 从 1.9 s 被拖到 82.9 s、瞬时 free 归零）。
+   判断有无退化应盯 **heal 触发次数与最低 free**，不是 TTFT（要分辨 2–5% 的 TTFT 差，
+   需同协议各跑 9 个 8K）。
+3. **0.97 的深层压力开始变形**：262K 单发 123.1 s，canary 868 tok 被拖 82.9 s，而
+   kv_usage 峰值只有 0.59、0 抢占——即**不是 KV 满，而是分配/调度被挤**。慢的原因仍
+   是假设（分配器无 free 可用 → 长 prefill 里频繁 empty_cache/cudaFree 卡流），要坐实
+   需要 step 级时间分解。注意 262K 的两个数不是同一把尺子：0.94 的 57.7 s 来自 vision
+   probe（含 1,024 tok 解码），0.97 的 123.1 s 来自饱和 probe（out=16），所以"慢一倍"只是线索。
+
+**服务默认改为 0.96**（`start_qwen38_flash_next.ps1`）：0.96 相对 0.94 在速度上分辨不出，
+却多出 11.6% 的 KV 容量，且仍留 1.9 GiB 空闲余量；0.97 只在确实需要多 66k tokens 时开，
+且 healer 必须开。测量臂（`_dev/bin/_serve_bg.ps1`）仍钉 0.94，结构 probe 内部默认仍是 0.90，
+以保有历史可比性。
+
+另：手设 `-KvGiB` 不要超过 **12.8 GiB**，它绕过同一套上限校验，只会更早撞墙。
+
 - ⚠ **服务跑的是安装树**（`.flashnext-root/.venv/Lib/site-packages/vllm` 是 junction → `.venv-flashnext/Lib/site-packages/vllm`），不是仓库 `vllm/`。改完仓库文件必须拷进安装树；**重装/重建 vllm 后这两份要重新拷**。

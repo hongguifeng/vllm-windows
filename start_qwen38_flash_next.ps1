@@ -22,7 +22,7 @@ param(
     [int]$MaxLen = 262144,
     [int]$MaxSeqs = 4,
     [int]$BatchedTokens = 2048,
-    [double]$MemUtil = 0.94,
+    [double]$MemUtil = 0.96,
     [int]$KvGiB = 0,
     # Empty (default) = production behaviour unchanged. Bracketed list reproduces
     # the WSL arm's explicit CUDA-graph capture coverage.
