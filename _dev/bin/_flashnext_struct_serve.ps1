@@ -88,6 +88,11 @@ param(
     [string]$CaptureSizes = '',
     [switch]$Mtp,
     [int]$MtpTokens = 1,
+    # -AdaptiveK turns on the acceptance-adaptive draft count: the scheduler
+    # picks this step's verification width from the running requests' recent
+    # acceptance instead of always using -MtpTokens. Value is the maximum count
+    # (must be <= -MtpTokens); 0 leaves speculative decoding byte-identical.
+    [int]$AdaptiveK = 0,
     [string]$ToolParser = 'qwen3_xml',
     [switch]$NoTools,
     [switch]$NoReasoningParser,
@@ -305,9 +310,16 @@ if ($NSys) {
     $argv += @('--profiler-config.profiler', 'cuda')
 }
 if ($Mtp) {
-    $argv += @('--speculative-config',
-               (EscJson ('{"method": "mtp", "num_speculative_tokens": ' +
-                   $MtpTokens + '}')))
+    $spec = '{"method": "mtp", "num_speculative_tokens": ' + $MtpTokens + '}'
+    if ($AdaptiveK -gt 0) {
+        if ($AdaptiveK -gt $MtpTokens) {
+            throw "-AdaptiveK ($AdaptiveK) cannot exceed -MtpTokens ($MtpTokens)"
+        }
+        $spec = '{"method": "mtp", "num_speculative_tokens": ' + $MtpTokens +
+            ', "adaptive_k": {"min": 1, "max": ' + $AdaptiveK +
+            ', "log_interval": 200}}'
+    }
+    $argv += @('--speculative-config', (EscJson $spec))
 }
 if ($AsyncSched) {
     # Overlap the CPU side of a step with the GPU side; worth it when a step is

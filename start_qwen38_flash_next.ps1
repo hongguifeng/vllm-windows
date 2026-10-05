@@ -40,6 +40,10 @@ param(
     [int]$PleWorkers = 16,
     [int]$PlePrefetchTokens = 16384,
     [int]$MtpTokens = 3,
+    # Acceptance-adaptive draft count (0 = off, i.e. speculative decoding stays
+    # byte-identical to upstream). Value is the maximum verification width the
+    # policy may choose, so it must not exceed -MtpTokens.
+    [int]$AdaptiveK = 0,
     [string]$Venv = 'D:\code\vllm-windows\.flashnext-root',
     [switch]$NoVision,
     [int]$MaxPixels = 1310720,
@@ -114,6 +118,7 @@ if (-not $NoVision) { $args += '-WithVision' }
 $args += @('-MaxPixels', "$MaxPixels")
 $args += @('-MaxImages', "$MaxImages")
 if (-not $NoMtp) { $args += @('-Mtp', '-MtpTokens', "$MtpTokens") }
+if ($AdaptiveK -gt 0) { $args += @('-AdaptiveK', "$AdaptiveK") }
 if ($Async -and -not $NoAsync) { $args += '-AsyncSched' }
 if ($NoTools) { $args += '-NoTools' }
 if ($NoReasoningParser) { $args += '-NoReasoningParser' }
