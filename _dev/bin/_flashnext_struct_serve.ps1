@@ -91,8 +91,10 @@ param(
     # -AdaptiveK turns on the acceptance-adaptive draft count: the scheduler
     # picks this step's verification width from the running requests' recent
     # acceptance instead of always using -MtpTokens. Value is the maximum count
-    # (must be <= -MtpTokens); 0 leaves speculative decoding byte-identical.
-    [int]$AdaptiveK = 0,
+    # (must be <= -MtpTokens). Default -1 means "follow -MtpTokens", i.e. the
+    # feature is on; pass 0 to keep speculative decoding byte-identical to a
+    # fixed draft count.
+    [int]$AdaptiveK = -1,
     [string]$ToolParser = 'qwen3_xml',
     [switch]$NoTools,
     [switch]$NoReasoningParser,
@@ -310,6 +312,7 @@ if ($NSys) {
     $argv += @('--profiler-config.profiler', 'cuda')
 }
 if ($Mtp) {
+    if ($AdaptiveK -lt 0) { $AdaptiveK = $MtpTokens }
     $spec = '{"method": "mtp", "num_speculative_tokens": ' + $MtpTokens + '}'
     if ($AdaptiveK -gt 0) {
         if ($AdaptiveK -gt $MtpTokens) {
@@ -398,6 +401,7 @@ Write-Host ("mode   : " + $(if ($Graphs) { 'CUDA graphs' } else { 'enforce-eager
 Write-Host ("limits : $MaxLen ctx, $MaxSeqs seqs, $BatchedTokens batched tokens, util $MemUtil" +
     $(if ($PrefillChunkWithDecodes -gt 0) { ", prefill chunk w/ decodes $PrefillChunkWithDecodes" } else { '' }) +
     $(if ($MaxNumPartialPrefills -gt 0) { ", partial prefills $MaxNumPartialPrefills" } else { '' }) +
+    $(if ($Mtp -and $AdaptiveK -gt 0) { ", adaptive k<=$AdaptiveK" } else { ', fixed k' }) +
             $(if ($KvGiB -gt 0) { ", KV $KvGiB GiB fixed" } else { '' }) +
             $(if ($LoadStrategy) { ", load $LoadStrategy" } else { '' }) +
             $(if ($NoAllocHeal) { ', alloc-heal OFF' } else { ", alloc-heal free<$($env:QSA_ALLOC_HEAL_FREE_MB)MiB cached>$($env:QSA_ALLOC_HEAL_CACHED_MB)MiB" }))
