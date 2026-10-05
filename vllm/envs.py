@@ -176,7 +176,7 @@ if TYPE_CHECKING:
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_MOE_MASK_PADDING: bool = False
-    VLLM_DETERMINISTIC_MOE_ALIGN: bool = False
+    VLLM_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_FLA_PIN_AUTOTUNE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
@@ -1485,10 +1485,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of by atomic arrival order. This model has 512 routed experts, so
     # the CUDA launcher always takes its two-kernel path, whose count_and_sort
     # kernel ranks with a global atomicAdd; the fused MoE then accumulates each
-    # expert in whatever order that produced. Default OFF until the cost is
-    # measured.
-    "VLLM_DETERMINISTIC_MOE_ALIGN": lambda: bool(
-        int(os.getenv("VLLM_DETERMINISTIC_MOE_ALIGN", "0"))
+    # expert in whatever order that produced. 0 = upstream CUDA op (default),
+    # 1 = deterministic Triton kernel, 2 = deterministic torch path for A/B.
+    "VLLM_DETERMINISTIC_MOE_ALIGN": lambda: int(
+        os.getenv("VLLM_DETERMINISTIC_MOE_ALIGN", "0")
     ),
     # Pin every @triton.autotune'd kernel of the vendored flash-linear-attention
     # ops and the GLM-5 KDA chunked-prefill kernels to ONE config per autotune

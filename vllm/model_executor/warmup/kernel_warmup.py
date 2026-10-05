@@ -193,6 +193,21 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
 
+    # The deterministic MoE block alignment (moe_align_kernel.py). Same reason:
+    # its per-(device, E) scratch is allocate-once and Triton compiles on first
+    # launch, neither of which may happen inside a capture. No-op unless
+    # VLLM_DETERMINISTIC_MOE_ALIGN selects the kernel path.
+    from vllm.model_executor.layers.fused_moe.moe_align_kernel import (
+        warmup_from_worker as warmup_moe_align,
+    )
+
+    warmed_experts = warmup_moe_align(worker)
+    if warmed_experts:
+        logger.info(
+            "Warmed up the deterministic MoE alignment kernels for %d experts.",
+            warmed_experts,
+        )
+
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
@@ -413,12 +428,14 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     timings are averaged over the world CPU group so all ranks select the
     same tactic.
     """
-    # TODO: Remove win_fix_enable_set_autotune_process_group when https://github.com/flashinfer-ai/flashinfer/issues/3786 is resolved
+    # TODO: Remove win_fix_enable_set_autotune_process_group when
+    # https://github.com/flashinfer-ai/flashinfer/issues/3786 is resolved
     win_fix_enable_set_autotune_process_group = True
     try:
         from flashinfer.autotuner import AutoTuner, set_autotune_process_group
-    except:
+    except ImportError:
         from flashinfer.autotuner import AutoTuner
+
         win_fix_enable_set_autotune_process_group = False
 
     import vllm.utils.flashinfer as fi_utils
