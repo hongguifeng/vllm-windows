@@ -707,7 +707,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
-        if get_current_vllm_config().additional_config.get("ple_ssd_offload"):
+        additional_config = get_current_vllm_config().additional_config
+        if isinstance(additional_config, dict) and additional_config.get(
+            "ple_ssd_offload"
+        ):
             from .ple_ssd import Qwen4ExpPLESSDEmbedding
 
             embedding_cls = Qwen4ExpPLESSDEmbedding
@@ -722,6 +725,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             max_total_tokens=max_total_tokens,
             data_parallel_rank=data_parallel_rank,
         )
+        if self.ngram_embedding.supports_prefetch:
+            # The side-stream lookup outlives eager-break args, whose
+            # graph-pool storage later segments may reuse. The model is built
+            # on the meta device, so this buffer is placed on the runtime
+            # device explicitly.
+            self._prefetch_ids = torch.empty(
+                max_total_tokens,
+                self.ngram_heads,
+                dtype=torch.long,
+                device=get_current_vllm_config().device_config.device,
+            )
         weight = self.ngram_embedding.weight
         logger.info(
             "Initialized PLE embedding %s: quantization_method=%s, "
@@ -870,6 +884,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             input_ids,
             query_start_loc,
             ngram_context,
+            output=self._prefetch_ids[: input_ids.numel()],
         )
         embedding.start_prefetch(hidden_states, ngram_ids)
 
