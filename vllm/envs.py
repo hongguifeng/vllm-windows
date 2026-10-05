@@ -178,6 +178,8 @@ if TYPE_CHECKING:
     VLLM_MOE_MASK_PADDING: bool = False
     VLLM_DETERMINISTIC_MOE_ALIGN: int = 0
     VLLM_FLA_PIN_AUTOTUNE: bool = False
+    VLLM_MEM_ATTRIBUTION: bool = False
+    VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1503,6 +1505,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # terms, and what the attention metadata builders allocate after the KV
     # cache is sized. Logging only; the KV cache size is unchanged.
     "VLLM_MEM_ATTRIBUTION": lambda: bool(int(os.getenv("VLLM_MEM_ATTRIBUTION", "0"))),
+    # Align-mode Mamba KV reservation under async scheduling or pipeline
+    # parallelism: also reserve the state blocks a request holds for the
+    # prefill chunks it has in flight (min(max_concurrent_batches,
+    # cdiv(max_in_flight_tokens, block)) - 1 per group beyond the two of
+    # synchronous scheduling), charged once per running request. Changes the
+    # reported KV capacity and the single-request fit check; the block pool
+    # and the admission cap are unchanged. Default OFF.
+    "VLLM_KV_MAMBA_INFLIGHT_STATES": lambda: bool(
+        int(os.getenv("VLLM_KV_MAMBA_INFLIGHT_STATES", "0"))
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
