@@ -25,6 +25,11 @@ param(
     [int]$MaxLen = 262144,
     [int]$MaxSeqs = 4,
     [int]$BatchedTokens = 2048,
+    # Fair chunked prefill; 0 (default) leaves scheduling identical to upstream.
+    # 384 keeps a co-resident decode's step near 0.15 s while a long prompt
+    # prefills instead of ~0.8 s at the 2048-token batch budget.
+    [int]$PrefillChunkWithDecodes = 0,
+    [int]$MaxNumPartialPrefills = 0,
     [double]$MemUtil = 0.96,
     [int]$KvGiB = 0,
     # Empty (default) = production behaviour unchanged. Bracketed list reproduces
@@ -94,6 +99,12 @@ $args = @(
     '-PleSsd'
 )
 if ($CaptureSizes) { $args += @('-CaptureSizes', $CaptureSizes) }
+if ($PrefillChunkWithDecodes -gt 0) {
+    $args += @('-PrefillChunkWithDecodes', "$PrefillChunkWithDecodes")
+}
+if ($MaxNumPartialPrefills -gt 0) {
+    $args += @('-MaxNumPartialPrefills', "$MaxNumPartialPrefills")
+}
 if (-not $NoGraphs) { $args += '-Graphs' }
 if ($NoAllocHeal) { $args += '-NoAllocHeal' }
 if ($DryRun) { $args += '-DryRun' }

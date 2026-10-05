@@ -44,6 +44,12 @@ param(
     [int]$MaxLen = 4096,
     [int]$MaxSeqs = 4,
     [int]$BatchedTokens = 2048,
+    # Fair chunked prefill (both default 0 = upstream scheduling). A positive
+    # -PrefillChunkWithDecodes caps the prefill tokens issued per step whenever
+    # something is decoding, which is what keeps co-resident decode latency down
+    # while a long prompt is being prefilled.
+    [int]$PrefillChunkWithDecodes = 0,
+    [int]$MaxNumPartialPrefills = 0,
     [double]$MemUtil = 0.96,
     [string]$LoadStrategy = '',
     [long]$KvGiB = 0,
@@ -246,6 +252,12 @@ if ($CaptureSizes) {
 if ($LoadStrategy) {
     $argv += @('--safetensors-load-strategy', $LoadStrategy)
 }
+if ($PrefillChunkWithDecodes -gt 0) {
+    $argv += @('--prefill-chunk-with-decodes', "$PrefillChunkWithDecodes")
+}
+if ($MaxNumPartialPrefills -gt 0) {
+    $argv += @('--max-num-partial-prefills', "$MaxNumPartialPrefills")
+}
 if ($KvGiB -gt 0) {
     $kvBytes = [long]($KvGiB * 1GB)
     $argv += @('--kv-cache-memory-bytes', "$kvBytes")
@@ -372,6 +384,8 @@ Write-Host ("mode   : " + $(if ($Graphs) { 'CUDA graphs' } else { 'enforce-eager
             $(if ($NoReasoningParser) { '  no reasoning parser' } else { '  + reasoning qwen3' }) +
             $(if ($ThinkingOnDefault) { '  thinking on by default' } else { '  thinking off by default' }))
 Write-Host ("limits : $MaxLen ctx, $MaxSeqs seqs, $BatchedTokens batched tokens, util $MemUtil" +
+    $(if ($PrefillChunkWithDecodes -gt 0) { ", prefill chunk w/ decodes $PrefillChunkWithDecodes" } else { '' }) +
+    $(if ($MaxNumPartialPrefills -gt 0) { ", partial prefills $MaxNumPartialPrefills" } else { '' }) +
             $(if ($KvGiB -gt 0) { ", KV $KvGiB GiB fixed" } else { '' }) +
             $(if ($LoadStrategy) { ", load $LoadStrategy" } else { '' }) +
             $(if ($NoAllocHeal) { ', alloc-heal OFF' } else { ", alloc-heal free<$($env:QSA_ALLOC_HEAL_FREE_MB)MiB cached>$($env:QSA_ALLOC_HEAL_CACHED_MB)MiB" }))
