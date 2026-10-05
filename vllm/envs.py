@@ -175,7 +175,7 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
-    VLLM_FLA_PIN_AUTOTUNE: bool = False
+    VLLM_MOE_MASK_PADDING: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1472,19 +1472,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
-    # Pin every @triton.autotune'd kernel of the vendored flash-linear-attention
-    # ops and the GLM-5 KDA chunked-prefill kernels to ONE config per autotune
-    # key on sm_80 (table in
-    # vllm/third_party/flash_linear_attention/ops/autotune_pins.py), so a boot
-    # never benchmarks and the chosen config, hence the reduction order, is a
-    # pure function of the shape. Read when those modules are imported; other
-    # devices keep normal autotuning. Off by default.
-    "VLLM_FLA_PIN_AUTOTUNE": lambda: bool(int(os.getenv("VLLM_FLA_PIN_AUTOTUNE", "0"))),
-    # Log where device memory goes at start-up: resident bytes per module
-    # group after loading, the peak of each profile_run stage, the KV sizing
-    # terms, and what the attention metadata builders allocate after the KV
-    # cache is sized. Logging only; the KV cache size is unchanged.
-    "VLLM_MEM_ATTRIBUTION": lambda: bool(int(os.getenv("VLLM_MEM_ATTRIBUTION", "0"))),
+    # Route the padding rows of a padded batch (CUDA-graph sizes) to no
+    # expert (topk_ids = -1) before the fused MoE. Their hidden states come
+    # from stale input buffers, and where they land in the expert blocks
+    # changes how Marlin splits K for the real rows next to them, so the same
+    # request otherwise gets last-bit different MoE outputs depending on what
+    # ran before. Uses the forward context's is_padding mask. Default OFF.
+    "VLLM_MOE_MASK_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_MASK_PADDING", "0"))),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
