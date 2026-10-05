@@ -181,6 +181,7 @@ if TYPE_CHECKING:
     VLLM_MEM_ATTRIBUTION: bool = False
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
     VLLM_KV_SWA_INFLIGHT_SCRATCH: bool = False
+    VLLM_DFLASH_BOUNDARY_CACHE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1525,6 +1526,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # connector. Default OFF.
     "VLLM_KV_SWA_INFLIGHT_SCRATCH": lambda: bool(
         int(os.getenv("VLLM_KV_SWA_INFLIGHT_SCRATCH", "0"))
+    ),
+    # DFlash drafts carry their own token positions; at a prefix-cache boundary
+    # the drafter can reuse the target's already-finalized context instead of
+    # recomputing it. Changes the KV reservation for DFlash requests and which
+    # blocks are reused at a boundary; default OFF.
+    "VLLM_DFLASH_BOUNDARY_CACHE": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_BOUNDARY_CACHE", "0"))
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
