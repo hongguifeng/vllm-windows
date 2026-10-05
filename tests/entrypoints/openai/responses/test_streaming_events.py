@@ -138,6 +138,29 @@ class TestProcessorCompoundDeltas:
         assert len(deltas) == 1
         assert deltas[0].delta == '{"city":"SF"}'
 
+    def test_args_chunk_before_name_is_flushed(self):
+        """Regression: an argument chunk that arrives before the call's name
+        is held back instead of being swallowed by the NONE branch, and is
+        replayed as soon as the call opens."""
+        processor = SimpleStreamingEventProcessor()
+        held = _run_through_processor(
+            processor,
+            DeltaMessage(tool_calls=[_make_tool_call(0, arguments='{"city":"SF"}')]),
+        )
+        assert not held
+        assert processor.pending_tool_args[0] == '{"city":"SF"}'
+
+        events = _run_through_processor(
+            processor,
+            DeltaMessage(tool_calls=[_make_tool_call(0, name="get_weather")]),
+        )
+        deltas = [
+            e for e in events if e.type == "response.function_call_arguments.delta"
+        ]
+        assert len(deltas) == 1
+        assert deltas[0].delta == '{"city":"SF"}'
+        assert processor.pending_tool_args == {}
+
     def test_reasoning_to_content_transition(self):
         """Regression: the old special case in emit_delta handled this;
         now split_delta handles it generically."""

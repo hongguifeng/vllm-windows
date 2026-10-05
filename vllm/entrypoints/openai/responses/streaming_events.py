@@ -1039,7 +1039,7 @@ def emit_simple_tool_call_open(
                 type="function_call",
                 id=state.current_item_id,
                 call_id=state.tool_call_id,
-                name=name,
+                name=name or "",
                 namespace=namespace,
                 arguments="",
                 status="in_progress",
@@ -1181,6 +1181,7 @@ class SimpleStreamingEventProcessor:
     ) -> None:
         self.state = state or SimpleStreamingState()
         self.tool_call_name_map = build_responses_tool_call_name_map(tools)
+        self.pending_tool_args: dict[int | None, str] = {}
 
     def resolve_target_state(
         self, delta_message: DeltaMessage
@@ -1191,11 +1192,23 @@ class SimpleStreamingEventProcessor:
         For TOOL_CALL the first tool_call object is also returned so
         callers can detect a switch between consecutive tools.
         """
-        if (
-            delta_message.tool_calls
-            and delta_message.tool_calls[0].function is not None
-        ):
-            return _StateType.TOOL_CALL, delta_message.tool_calls[0]
+        tool_calls = delta_message.tool_calls
+        tool_call = tool_calls[0] if tool_calls else None
+        if tool_call is not None and tool_call.function is not None:
+            function = tool_call.function
+            # The name is streamed once, on the first delta of a call; the
+            # argument chunks that follow carry function.name=None.
+            inside_this_call = (
+                self.state.current_state == _StateType.TOOL_CALL
+                and self.state.tool_call_index == tool_call.index
+            )
+            if function.name or inside_this_call:
+                return _StateType.TOOL_CALL, tool_call
+            # Not inside the call yet and no name: hold the chunk back so a
+            # NONE delta does not swallow it.
+            self.pending_tool_args[tool_call.index] = self.pending_tool_args.get(
+                tool_call.index, ""
+            ) + (function.arguments or "")
         if delta_message.reasoning is not None:
             return _StateType.REASONING, None
         if delta_message.content:
@@ -1239,12 +1252,16 @@ class SimpleStreamingEventProcessor:
                 tool_call.function.name,
                 tool_call_name_map=self.tool_call_name_map,
             )
-            return handlers.open_fn(
+            events = handlers.open_fn(
                 self.state,
                 call_name.name,
                 tool_call.index,
                 call_name.namespace,
             )
+            pending = self.pending_tool_args.pop(tool_call.index, "")
+            if pending:
+                events.extend(handlers.delta_fn(self.state, pending))
+            return events
         return handlers.open_fn(self.state)
 
     def emit_delta(
