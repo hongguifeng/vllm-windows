@@ -180,6 +180,7 @@ if TYPE_CHECKING:
     VLLM_FLA_PIN_AUTOTUNE: bool = False
     VLLM_MEM_ATTRIBUTION: bool = False
     VLLM_KV_MAMBA_INFLIGHT_STATES: bool = False
+    VLLM_KV_SWA_INFLIGHT_SCRATCH: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1514,6 +1515,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and the admission cap are unchanged. Default OFF.
     "VLLM_KV_MAMBA_INFLIGHT_STATES": lambda: bool(
         int(os.getenv("VLLM_KV_MAMBA_INFLIGHT_STATES", "0"))
+    ),
+    # KV capacity report: charge the in-flight part of a sliding-window
+    # group's per-request reservation (the blocks a request holds only while
+    # it has steps in flight) once per running request (max_num_seqs) instead
+    # of once per concurrency slot, like the Mamba speculative scratch.
+    # Accounting only: the block pool, the admission cap and the
+    # single-request fit check are unchanged. Not applied with a KV
+    # connector. Default OFF.
+    "VLLM_KV_SWA_INFLIGHT_SCRATCH": lambda: bool(
+        int(os.getenv("VLLM_KV_SWA_INFLIGHT_SCRATCH", "0"))
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
