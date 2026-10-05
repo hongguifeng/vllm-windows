@@ -54,6 +54,9 @@ param(
     [switch]$NoMtp,
     [switch]$NoGraphs,
     [switch]$SkipGuard,
+    # Kill whatever holds the engine handshake port (29550) or -Port instead of
+    # failing fast; see the guard in _flashnext_struct_serve.ps1.
+    [switch]$Force,
     [switch]$DryRun,
     [switch]$Async,
     [switch]$NoAsync,
@@ -131,9 +134,11 @@ if ($ToolParser) { $args += @('-ToolParser', $ToolParser) }
 # A child powershell parses $args as named parameters; an in-process @args splat
 # would bind them positionally.
 if ($DryRun) {
+    # Still reaches the port guard, which only reports under -DryRun.
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $launcher @args
     exit $LASTEXITCODE
 }
+if ($Force) { $args += '-Force' }
 
 & "$repo\_start_vllm_service.ps1" `
     -ServerScript $launcher `

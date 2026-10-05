@@ -99,6 +99,11 @@ param(
     [switch]$NoTools,
     [switch]$NoReasoningParser,
     [switch]$ThinkingOnDefault,
+    # -Force kills whatever holds the engine handshake port; without it the
+    # script fails fast instead (see the port guard below).
+    [switch]$Force,
+    # Engine handshake port. 0 = derive one from -Port (see the guard below).
+    [int]$DpRpcPort = 0,
     [switch]$DryRun
 )
 
@@ -110,6 +115,36 @@ $py   = "$Venv\.venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath "$Model\config.json")) {
     Write-Host "ERROR: no config.json under $Model -- run _dev\probe\_flashnext_trim.py first" -ForegroundColor Red
     exit 1
+}
+
+# The engine handshake socket is a machine-global singleton by default: its
+# port is `data_parallel_rpc_port`'s config default (29550) and on Windows
+# launch_core_engines forces handshake_local_only=False, so the address is that
+# fixed TCP one rather than a per-process uuid. Two consequences, both seen on
+# this rig: a crashed instance (the API server outlives a failed EngineCore)
+# keeps 29550 bound and the next start dies a minute in with
+# `zmq.error.ZMQError: Address in use`, and a second instance can only come up
+# by sharing that one port, which lets a frontend handshake with the wrong
+# EngineCore. Give every instance its own port instead: -Force is then only
+# about this instance's leftovers.
+if ($DpRpcPort -le 0) { $DpRpcPort = 29550 + ($Port % 1000) }
+foreach ($p in $DpRpcPort, $Port) {
+    $conn = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue
+    if ($conn) {
+        $pids = ($conn | Select-Object -ExpandProperty OwningProcess -Unique) -join ', '
+        if ($DryRun) {
+            # -DryRun starts nothing and must not touch a single process.
+            Write-Host "port $p held by PID $pids (-DryRun: reporting only, nothing killed)" -ForegroundColor DarkGray
+        } elseif ($Force) {
+            Write-Host "port $p held by PID $pids - killing (-Force)" -ForegroundColor Yellow
+            $pids -split ', ' | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+            Start-Sleep -Seconds 2
+        } else {
+            Write-Host "ERROR: port $p is already in use by PID $pids" -ForegroundColor Red
+            Write-Host "       (a leftover EngineCore? re-run with -Force to kill it)" -ForegroundColor Yellow
+            exit 1
+        }
+    }
 }
 
 # -FullWeights moves to the real 143 GiB checkpoint unless -Model was given.
@@ -226,6 +261,7 @@ $argv = @(
     '--served-model-name', $ServedName,
     '--host', '127.0.0.1',
     '--port', "$Port",
+    '--data-parallel-rpc-port', "$DpRpcPort",
     '--dtype', 'bfloat16',
     '--max-model-len', "$MaxLen",
     '--max-num-seqs', "$MaxSeqs",
