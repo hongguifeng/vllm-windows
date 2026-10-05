@@ -86,6 +86,7 @@ from vllm.v1.watermarking.spec_decode import (
 )
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+from vllm.v1.worker.gpu import mem_attribution
 from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
@@ -304,6 +305,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
 
         self.step_timing = StepTimingCollector()
+        # Open step-timing window, if any; None once the window is reported.
+        self._timing_cm: Any = None
 
         # General request states.
         self.req_states = RequestState(
@@ -426,6 +429,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "Model loading took %s GiB memory and %.6f seconds",
             format_gib(m.consumed_memory),
             time_after_load - time_before_load,
+        )
+        mem_attribution.log_load_inventory(
+            [
+                ("target", self.model),
+                ("drafter", getattr(self.speculator, "model", None)),
+            ],
+            m.consumed_memory,
         )
 
         # Initialize the components that require the model.
@@ -627,7 +637,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if isinstance(self.speculator, DraftModelSpeculator):
             draft_attn_layer_names = self.speculator.draft_attn_layer_names
         # Metadata builders select attention kernels that need JIT warmup.
-        with self.jit_warmup_registry.activate():
+        with (
+            self.jit_warmup_registry.activate(),
+            mem_attribution.AfterKvAllocations(
+                "graph-profile KV" if is_profiling else "serving KV"
+            ),
+        ):
             (
                 self.attn_groups,
                 attn_cg_support,
@@ -933,6 +948,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        stages = mem_attribution.ProfileStages()
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -948,10 +964,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.model_state.encoder_runner.profile_encoder_cache(
                     dummy_mm_inputs, mm_budget
                 )
+        stages.stage("mm_encoder_profile")
 
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
+        stages.stage(f"lm_dummy_run({self.max_num_tokens})")
 
         # Only run sampler/pooler on last PP rank (non-last ranks return None).
         if self.is_last_pp_rank:
@@ -960,6 +978,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._dummy_sampler_run(sample_hidden_states)
             else:
                 self._dummy_pooler_run(hidden_states)
+        stages.stage("sampler")
+        stages.finish()
 
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
