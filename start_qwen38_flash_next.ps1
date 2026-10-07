@@ -35,8 +35,13 @@ param(
     # Empty (default) = production behaviour unchanged. Bracketed list reproduces
     # the WSL arm's explicit CUDA-graph capture coverage.
     [string]$CaptureSizes = '',
-    [int]$PleDepth = 256,
-    [int]$PleCacheMb = 512,
+    # Row cache and AIO queue depth are the measured lever for long prefill:
+    # 32768-token TTFT drops 15-19% going from 512 MiB / depth 256 to 8192 MiB /
+    # depth 512, with no regression at 8192 tokens (_dev/docs/PREFILL_KNOB_CLAIM_AB.md).
+    # 8192 MiB holds 19.2M of the 320M PLE rows (row_bytes 320) and costs ~7.5 GiB
+    # of host RAM; commit headroom stayed >63 GiB throughout that campaign.
+    [int]$PleDepth = 512,
+    [int]$PleCacheMb = 8192,
     [int]$PleWorkers = 16,
     [int]$PlePrefetchTokens = 16384,
     [int]$MtpTokens = 3,
