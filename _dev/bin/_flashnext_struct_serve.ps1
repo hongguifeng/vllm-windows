@@ -18,6 +18,7 @@
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -Graphs      # drop --enforce-eager
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -DryRun      # print argv only
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -ThinkingOnDefault  # template default (thinking on)
+#   & ...\_flashnext_struct_serve.ps1 -NoPromptTokensDetails  # usage without prompt_tokens_details
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -NoTools -NoReasoningParser  # probe arms
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -FullWeights  # the 143 GiB checkpoint
 #   & D:\code\vllm-windows\_dev\bin\_flashnext_struct_serve.ps1 -FullWeights -PleSsd
@@ -99,6 +100,9 @@ param(
     [switch]$NoTools,
     [switch]$NoReasoningParser,
     [switch]$ThinkingOnDefault,
+    # usage.prompt_tokens_details.cached_tokens is ON unless this is passed.
+    # Upstream ships the switch off (vllm/entrypoints/launchers/cli_args.py:139).
+    [switch]$NoPromptTokensDetails,
     # -Force kills whatever holds the engine handshake port; without it the
     # script fails fast instead (see the port guard below).
     [switch]$Force,
@@ -395,6 +399,15 @@ if (-not $NoReasoningParser) {
 if (-not $ThinkingOnDefault) {
     $argv += @('--default-chat-template-kwargs', (EscJson '{"enable_thinking": false}'))
 }
+# Lift the prefix-cache hit out of the black box: with this the usage block of
+# /v1/chat/completions and /v1/completions carries
+# prompt_tokens_details.cached_tokens (RequestOutput.num_cached_tokens) plus
+# created_cache_tokens, so a probe can tell "prefilled" from "served from cache"
+# without reading the server log. Upstream defaults it off, hence the on-by-default
+# here; -NoPromptTokensDetails restores the upstream shape for A/B arms.
+if (-not $NoPromptTokensDetails) {
+    $argv += '--enable-prompt-tokens-details'
+}
 
 Write-Host ''
 Write-Host '==== flash-next structural smoke ====' -ForegroundColor Cyan
@@ -433,7 +446,8 @@ Write-Host ("mode   : " + $(if ($Graphs) { 'CUDA graphs' } else { 'enforce-eager
             $(if ($AsyncSched) { '  + async scheduling' } else { '' }) +
             $(if ($NoTools) { '   tools OFF' } else { "  + tools ($ToolParser)" }) +
             $(if ($NoReasoningParser) { '  no reasoning parser' } else { '  + reasoning qwen3' }) +
-            $(if ($ThinkingOnDefault) { '  thinking on by default' } else { '  thinking off by default' }))
+            $(if ($ThinkingOnDefault) { '  thinking on by default' } else { '  thinking off by default' }) +
+            $(if ($NoPromptTokensDetails) { '  usage.cached_tokens OFF' } else { '  usage.cached_tokens ON' }))
 Write-Host ("limits : $MaxLen ctx, $MaxSeqs seqs, $BatchedTokens batched tokens, util $MemUtil" +
     $(if ($PrefillChunkWithDecodes -gt 0) { ", prefill chunk w/ decodes $PrefillChunkWithDecodes" } else { '' }) +
     $(if ($MaxNumPartialPrefills -gt 0) { ", partial prefills $MaxNumPartialPrefills" } else { '' }) +

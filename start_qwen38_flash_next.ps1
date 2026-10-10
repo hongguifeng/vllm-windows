@@ -11,6 +11,8 @@
 # Vision is ON by default: the tower takes ~2.3 GiB out of the auto KV budget, which
 # leaves MORE VRAM free than letting KV fill the whole 0.94 ceiling.
 #   & ...\start_qwen38_flash_next.ps1 -CaptureSizes '[1,2,3,...,2048]'  # explicit graph coverage
+#   & ...\start_qwen38_flash_next.ps1 -ThinkingOnDefault            # template default (thinking on)
+#   & ...\start_qwen38_flash_next.ps1 -NoPromptTokensDetails         # hide the prefix-cache hit from usage
 #
 # One card's service is stopped by D:\code\vllm-windows\stop_vllm.ps1 -Gpu 0 (or
 # -Gpu 1 / -Port 9393); with no argument it stops both, as before.
@@ -70,6 +72,8 @@ param(
     [switch]$NoTools,
     [switch]$NoReasoningParser,
     [switch]$ThinkingOnDefault,
+    # usage.prompt_tokens_details.cached_tokens is reported unless this is passed.
+    [switch]$NoPromptTokensDetails,
     # Swaps the default checkpoint to the AutoRound Uncensored build; an explicit
     # -Model/-ServedName still overrides it.
     [switch]$Unc
@@ -133,6 +137,8 @@ if ($NoTools) { $args += '-NoTools' }
 if ($NoReasoningParser) { $args += '-NoReasoningParser' }
 if ($ThinkingOnDefault) { $args += '-ThinkingOnDefault' }
 if ($ToolParser) { $args += @('-ToolParser', $ToolParser) }
+# Cached-prompt reporting is ON by default here; pass through only the off switch.
+if ($NoPromptTokensDetails) { $args += '-NoPromptTokensDetails' }
 
 # -DryRun prints the composed command and returns. Do not go through the service
 # wrapper, which waits on /health and would report an OLD server as "ready".
