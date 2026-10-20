@@ -4,6 +4,8 @@ import contextlib
 import errno
 import mmap
 import os
+import sys
+import tempfile
 import time
 from collections.abc import Callable
 
@@ -20,6 +22,55 @@ logger = init_logger(__name__)
 
 # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+
+# Windows has neither POSIX shared memory nor MADV_* flags. The region is a file
+# under the temp directory mapped through its handle, and its name can only be
+# removed once the mapping is closed (Windows refuses to delete a mapped file).
+_IS_WINDOWS = sys.platform == "win32"
+
+
+def _region_path(engine_id: str) -> str:
+    name = f"vllm_offload_{engine_id}.mmap"
+    if _IS_WINDOWS:
+        folder = os.environ.get("VLLM_OFFLOAD_REGION_DIR") or tempfile.gettempdir()
+        if folder and not os.path.isdir(folder):
+            os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, name)
+    return f"/dev/shm/{name}"
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        # Only Windows is allowed to leave the file behind: it is reaped by
+        # cleanup() after the mapping is closed, or by the temp directory.
+        if not _IS_WINDOWS:
+            raise
+
+
+def _sweep_stale_regions(keep: str) -> None:
+    """Remove region files left behind by earlier runs (Windows only).
+
+    Each run uses a fresh engine id, so a file a run could not delete is never
+    revisited by that engine's own cleanup. Deleting is safe to attempt: a file
+    another process still maps cannot be removed and simply stays.
+    """
+    if not _IS_WINDOWS:
+        return
+    folder = os.path.dirname(keep)
+    for name in os.listdir(folder):
+        if not name.startswith("vllm_offload_") or not name.endswith(".mmap"):
+            continue
+        path = os.path.join(folder, name)
+        if path == keep:
+            continue
+        if os.path.exists(path):
+            _unlink_quietly(path)
+            if not os.path.exists(path):
+                logger.info("Reclaimed stale offload region %s", path)
 
 
 def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> None:
@@ -55,6 +106,9 @@ def _get_populate_write_fn(
     mmap_obj: mmap.mmap,
 ) -> Callable[[mmap.mmap, int, int], None]:
     """Select the pre-faulting method once for this mmap."""
+    if _IS_WINDOWS or not hasattr(mmap_obj, "madvise"):
+        # No madvise on Windows: touch one byte per page instead.
+        return _fallback_populate_write
     try:
         _madvise_populate_write(mmap_obj, 0, mmap.PAGESIZE)
     except OSError as e:
@@ -107,7 +161,7 @@ class SharedOffloadRegion:
         self._row_stride = kv_bytes_per_chunk
         self.total_size_bytes = self.num_chunks * self._row_stride
 
-        self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
+        self.mmap_path = _region_path(engine_id)
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
         if rank is not None:
@@ -116,6 +170,11 @@ class SharedOffloadRegion:
             # exclusive upper bound for this worker's area within each row
             self._worker_area_end = (rank + 1) * cpu_page_size
         try:
+            if _IS_WINDOWS:
+                # A previous run that could not unlink a mapped file leaves it
+                # behind; a fresh region must not join that stale mapping. The
+                # unlink fails harmlessly while another process still maps it.
+                _unlink_quietly(self.mmap_path)
             try:
                 self.fd: int | None = os.open(
                     self.mmap_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
@@ -132,11 +191,13 @@ class SharedOffloadRegion:
                 # land on a 0-byte stub and spin in _wait_for_file_size
                 # for the full 30 s timeout.
                 self._creator = True
+                _sweep_stale_regions(self.mmap_path)
                 if creator_memory_check is not None:
                     creator_memory_check(self.total_size_bytes)
                 check_shm_free_space(
                     self.total_size_bytes,
-                    allocation_name="CPU KV offload shared region in /dev/shm",
+                    shm_path=os.path.dirname(self.mmap_path),
+                    allocation_name="CPU KV offload shared region",
                 )
                 os.ftruncate(self.fd, self.total_size_bytes)
                 logger.info(
@@ -145,27 +206,33 @@ class SharedOffloadRegion:
                     self.total_size_bytes / 1e9,
                 )
 
-            self.mmap_obj: mmap.mmap | None = mmap.mmap(
-                self.fd,
-                self.total_size_bytes,
-                flags=mmap.MAP_SHARED,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
-            )
+            if _IS_WINDOWS:
+                self.mmap_obj: mmap.mmap | None = mmap.mmap(
+                    self.fd, self.total_size_bytes
+                )
+            else:
+                self.mmap_obj = mmap.mmap(
+                    self.fd,
+                    self.total_size_bytes,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
 
             if populate_only_on_creator and self._creator:
                 populate_write_fn = _get_populate_write_fn(self.mmap_obj)
                 populate_write_fn(self.mmap_obj, 0, self.total_size_bytes)
         except Exception:
-            if self._creator:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(self.mmap_path)
-                self._creator = False
             if hasattr(self, "mmap_obj") and self.mmap_obj is not None:
                 self.mmap_obj.close()
                 self.mmap_obj = None
             if hasattr(self, "fd") and self.fd is not None:
                 os.close(self.fd)
                 self.fd = None
+            # Unmap and close before unlinking: Windows refuses to delete a
+            # mapped file, POSIX does not care either way.
+            if self._creator:
+                _unlink_quietly(self.mmap_path)
+                self._creator = False
             # Peers block inside the barrier until the collective times out if
             # we die before reaching it.  Arrive anyway so every worker calls
             # barrier() exactly once and they fail on their own errors instead
@@ -187,19 +254,25 @@ class SharedOffloadRegion:
             try:
                 barrier()
             except Exception:
-                if self._creator:
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(self.mmap_path)
-                    self._creator = False
                 self.mmap_obj.close()
                 os.close(self.fd)
                 self.mmap_obj = None
                 self.fd = None
+                if self._creator:
+                    _unlink_quietly(self.mmap_path)
+                    self._creator = False
                 raise
             if self._creator:
-                os.unlink(self.mmap_path)
-                self._creator = False
-                logger.info("Unlinked mmap file %s", self.mmap_path)
+                if _IS_WINDOWS:
+                    # A mapped file cannot be removed on Windows; cleanup()
+                    # removes it after the mapping is closed.
+                    logger.info(
+                        "Mmap file %s stays until cleanup", self.mmap_path
+                    )
+                else:
+                    _unlink_quietly(self.mmap_path)
+                    self._creator = False
+                    logger.info("Unlinked mmap file %s", self.mmap_path)
 
         self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
         self._views: list[torch.Tensor] = []
