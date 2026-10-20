@@ -84,6 +84,9 @@ breakable CUDA graph 都正常。短请求里 spec decode 计数 29 drafts / 60 
 
 ## 4. 边界与后续
 
+- 前提：仓库树里的编译产物（`vllm\*.pyd`、`vllm\vllm_flash_attn\` 的 `layers/ops/cute`、PLE SSD 的
+  native dll）都不在 git 里，换机器要先按
+  [`EXL3_WINDOWS_PORT_STATUS.md`](EXL3_WINDOWS_PORT_STATUS.md) §6 补齐。
 - TP=2 需要两张 170HX 全空 → 必须停掉单卡生产服务（本次停机约 12 分钟，已恢复 :9393）。
 - SSD PLE 仍不支持 ETP 跨 DP（会显式报错）；要支持得再加 `_gather_dp_ids`/`_select_embeddings`。
 - 未单独测量 PLE reduce 那一次集合通信的开销（每步每 PLE 层约 10 KiB，量级可忽略）。

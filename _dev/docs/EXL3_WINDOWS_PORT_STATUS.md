@@ -184,3 +184,24 @@ HARD-26 12/26 vs 16/26（p=0.34）、S-40 19/40 vs 22/40（p=0.45）、合并 31
 - Windows torch 的 `is_pin_memory_available()` 与 `is_uva_available()` 均为 True（PLE=ram 可用）。
 - 运行 Python 时必须 `PYTHONPATH=D:\code\vllm-windows`，否则会 import 到
   `.venv/Lib/site-packages/vllm` 的旧上游拷贝（0.29）。
+
+---
+
+## 6. 从 git 还原到一台干净机器
+
+仓库里**只有源码**：`git ls-files '*.pyd' '*.dll'` 为空（`.gitignore` 的 `*.py[cod]`、`_dev/out/`
+与 `_scratch/` 规则），模型权重也不在库里。clone 之后按顺序补齐，缺一项就起不来：
+
+| # | 补什么 | 用什么 | 落到哪 |
+|---|---|---|---|
+| 1 | 工具链 + venv | `_dev\bin\_env.ps1`（自动发现 MSVC / Windows SDK / CUDA 13.3） | 环境变量；跑任何命令都带 `PYTHONPATH=D:\code\vllm-windows` |
+| 2 | NCCL | `_dev\bin\_build_nccl.ps1` | `C:\nccl-windows\install\bin\nccl.dll`（只有 TP/PP 需要；`_env.ps1` 会把它塞进 `VLLM_NCCL_SO_PATH`） |
+| 3 | vllm 自身的 C/CUDA 扩展 | `_dev\bin\_flashtest_build.ps1`（构建 `.flashnext-root` worktree + venv，生产用的就是它）或 `_dev\bin\_build.ps1`（构建本仓库树，装进 `.venv`）；都是 `pip install . --no-build-isolation`，首次约 37 分钟，之后 ninja 增量 | 装在各自 venv 的 `site-packages\vllm`；要让**仓库树**自己也 import 得动，把 `_C_stable_libtorch`、`_moe_C_stable_libtorch`、`cumem_allocator`、`fs_io_C`、`spinloop` 这 5 个 `.pyd` 从那里拷到 `vllm\` |
+| 4 | flash-attn 的包体 | 把 `vllm\vllm_flash_attn\build\lib.win-amd64-cpython-312\vllm\vllm_flash_attn\` 下的 `layers\`、`ops\`、`cute\`（以及 `_vllm_fa2_C.pyd`，若在）拷回 | `vllm\vllm_flash_attn\`（缺了报 `No module named 'vllm.vllm_flash_attn.layers'`） |
+| 5 | EXL3 扩展 | `_dev\bin\_build_exl3.ps1`（首次约 5 分钟，增量 <1 分钟） | `vllm\_exl3_C.pyd`（4.84 MB，需与本机 torch 2.11 / CUDA 13.3 的 ABI 一致） |
+| 6 | PLE/SSD 原生读 | `_dev\bin\_ple_ssd_io_win_build.ps1`（`-OutDir` 可改落点） | `_dev\out\ple_ssd_io\ple_ssd_io_win.dll`；服务以**绝对路径**引用它，见 `start_qwen38_flash_next.ps1` 的 `--additional-config` |
+| 7 | 权重 | 不在 git | `D:\models\Qwen3.8-Flash-Next-exl3`（123 GB，25 个文件）；`D:\models\Qwen3.8-Flash-Next-AutoRound-3bpw-MTP`（142 GB，11 个分片，其中 102 GB 那片的 PLE 表走 SSD 流式） |
+
+顺序：1 → 3 → 4 → 5（EXL3 扩展依赖 `_env.ps1` 的编译器与 torch 头），2 与 6 互相独立。
+本机现有的事实基准可以直接对照：`vllm\` 下 6 个 `.pyd`（含 `_exl3_C`）、
+`vllm\vllm_flash_attn\` 下 `layers/ ops/ cute/ _vllm_fa2_C.pyd`、`_dev\out\ple_ssd_io\ple_ssd_io_win.dll`（106,496 B）。
