@@ -8,6 +8,7 @@ import argparse
 import concurrent.futures
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -36,15 +37,31 @@ def build_config(
     reasoning_effort,
     model_name,
     tool_call_format="",
+    api_key="EMPTY",
+    mode="vllm",
 ):
     cfg = yaml.safe_load(
         (builtin_config_dir / "benchmarks" / "swebench.yaml").read_text()
     )
-    chat_kwargs = {"enable_thinking": enable_thinking}
-    if tool_call_format:
-        chat_kwargs["tool_call_format"] = tool_call_format
-    if enable_thinking:
-        chat_kwargs["reasoning_effort"] = reasoning_effort
+    model_kwargs = {
+        "api_base": api_base,
+        "api_key": api_key,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "timeout": 600,
+        "drop_params": True,
+        "parallel_tool_calls": True,
+    }
+    if mode == "vllm":
+        chat_kwargs = {"enable_thinking": enable_thinking}
+        if tool_call_format:
+            chat_kwargs["tool_call_format"] = tool_call_format
+        if enable_thinking:
+            chat_kwargs["reasoning_effort"] = reasoning_effort
+        model_kwargs["extra_body"] = {"chat_template_kwargs": chat_kwargs}
+    elif enable_thinking:
+        # Hosted OpenAI-compatible endpoints take the effort as a top-level field.
+        model_kwargs["reasoning_effort"] = reasoning_effort
     return merge(
         cfg,
         {
@@ -53,16 +70,7 @@ def build_config(
             "model": {
                 "model_name": model_name,
                 "cost_tracking": "ignore_errors",
-                "model_kwargs": {
-                    "api_base": api_base,
-                    "api_key": "EMPTY",
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "timeout": 600,
-                    "drop_params": True,
-                    "parallel_tool_calls": True,
-                    "extra_body": {"chat_template_kwargs": chat_kwargs},
-                },
+                "model_kwargs": model_kwargs,
             },
         },
     )
@@ -104,6 +112,19 @@ def main():
     )
     p.add_argument("--output", required=True)
     p.add_argument("--api-base", required=True)
+    p.add_argument(
+        "--api-key",
+        default=os.environ.get("BENCH_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY")
+        or "EMPTY",
+        help="bearer token for hosted endpoints; defaults to BENCH_API_KEY/DEEPSEEK_API_KEY",
+    )
+    p.add_argument(
+        "--mode",
+        default="vllm",
+        choices=["vllm", "api"],
+        help="vllm sends chat_template_kwargs; api sends reasoning_effort natively",
+    )
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--max-tokens", type=int, default=1536)
     p.add_argument("--temperature", type=float, default=0.0)
@@ -155,6 +176,8 @@ def main():
         a.reasoning_effort,
         a.model_name,
         a.tool_call_format,
+        a.api_key,
+        a.mode,
     )
     pm = RunBatchProgressManager(
         len(instances), out / f"exit_statuses_{int(time.time())}.yaml"

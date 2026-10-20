@@ -149,6 +149,17 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
             return embeddings
         return embeddings.narrow(0, slot_offset, local_num_tokens)
 
+    def _reduce_etp_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Combine lookup results owned by different ETP ranks."""
+        if self.tp_size == 1:
+            return embeddings
+        assert self.parallel_group is not None
+        if embeddings.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # Each vocabulary row has one owner, so reduce the raw FP8 bytes.
+            reduced = self.parallel_group.all_reduce(embeddings.view(torch.int8))
+            return reduced.view(embeddings.dtype)
+        return self.parallel_group.all_reduce(embeddings)
+
     @abstractmethod
     def start_prefetch(
         self,
@@ -172,6 +183,11 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         embedding_dtype: str | None = None,
     ) -> "Qwen4ExpPLEEmbeddingMethod":
         """Select the concrete PLE embedding format for a layer."""
+        # A quantization method that owns the PLE storage picks its own method
+        # (EXL3 keeps the compressed trellis in the checkpoint file).
+        make_method = getattr(quant_config, "get_ple_embedding_method", None)
+        if make_method is not None:
+            return make_method()
         if embedding_dtype == "float8_e4m3fn":
             return Qwen4ExpPLEFp8EmbeddingMethod()
         # INC quantizes linear layers, leaving the PLE embedding unquantized.
@@ -480,17 +496,6 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             )
         return output
 
-    def _reduce_etp_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
-        """Combine pinned lookup results owned by different ETP ranks."""
-        if self.tp_size == 1:
-            return embeddings
-        assert self.parallel_group is not None
-        if embeddings.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            # Each vocabulary row has one owner, so reduce the raw FP8 bytes.
-            reduced = self.parallel_group.all_reduce(embeddings.view(torch.int8))
-            return reduced.view(embeddings.dtype)
-        return self.parallel_group.all_reduce(embeddings)
-
     @eager_break_during_capture
     def start_prefetch(
         self,
@@ -702,18 +707,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
-        additional_config = get_current_vllm_config().additional_config
-        if isinstance(additional_config, dict) and additional_config.get(
-            "ple_ssd_offload"
-        ):
-            from .ple_ssd import Qwen4ExpPLESSDEmbedding
+        quant_ple_cls = getattr(quant_config, "ple_embedding_cls", None)
+        if quant_ple_cls is not None:
+            # The quantization method owns the PLE storage; the generic
+            # device/pinned-host/SSD classes do not apply.
+            embedding_cls = quant_ple_cls
+        else:
+            embedding_cls = (
+                Qwen4ExpPLEPinnedHostEmbedding
+                if engram_config is not None and engram_config.cpu_offload
+                else Qwen4ExpPLEDeviceEmbedding
+            )
+            additional_config = get_current_vllm_config().additional_config
+            if isinstance(additional_config, dict) and additional_config.get(
+                "ple_ssd_offload"
+            ):
+                from .ple_ssd import Qwen4ExpPLESSDEmbedding
 
-            embedding_cls = Qwen4ExpPLESSDEmbedding
+                embedding_cls = Qwen4ExpPLESSDEmbedding
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,

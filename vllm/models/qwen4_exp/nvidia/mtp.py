@@ -157,6 +157,11 @@ def _make_draft_vllm_config(
             draft_quant_config.extra_config = _remap_quantized_layers(
                 extra_config, mtp_start_layer_idx
             )
+        # The draft's layers are numbered after the target's, so a config that
+        # maps checkpoint prefixes (EXL3) must know where the draft starts.
+        set_start = getattr(draft_quant_config, "set_mtp_start_layer_idx", None)
+        if set_start is not None:
+            set_start(mtp_start_layer_idx)
 
     draft_vllm_config = replace(
         vllm_config,
@@ -186,7 +191,16 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
 
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+        # EXL3 checkpoints can store the draft without its own embedding/head;
+        # the target's then own those weights.
+        shares = getattr(
+            vllm_config.quant_config, "mtp_shares_target_embeddings", None
+        )
+        self.embed_tokens = (
+            PPMissingLayer()
+            if shares is not None and shares(config)
+            else VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+        )
         draft_vllm_config = _make_draft_vllm_config(
             vllm_config,
             self.mtp_start_layer_idx,
@@ -291,7 +305,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden_size = self.hidden_size
         prev_block_output: torch.Tensor | None = None
 
-        if get_pp_group().is_first_rank:
+        if hidden_states is not None or get_pp_group().is_first_rank:
             assert hidden_states is not None
             if inputs_embeds is None:
                 assert input_ids is not None
@@ -396,7 +410,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             prefix=maybe_prefix(prefix, "mtp"),
         )
 
-        if get_pp_group().is_last_rank:
+        shares = getattr(self.quant_config, "mtp_shares_target_embeddings", None)
+        if shares is not None and shares(config):
+            self.lm_head = PPMissingLayer()
+        elif get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:

@@ -89,6 +89,14 @@ def load_general_plugins():
     for func in plugins.values():
         func()
 
+    # The fork's own registrations (EXL3 quantization method and load format)
+    # live in the tree and need no packaging entry point. Running them here
+    # puts them in place before any engine config resolves a quantization
+    # method; vllm.sm80.plugin.register is idempotent.
+    from vllm.sm80.plugin import register as register_sm80_plugin
+
+    register_sm80_plugin()
+
 
 def load_endpoint_plugins(
     supported_tasks: "tuple[SupportedTask, ...] | None" = None,

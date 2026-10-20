@@ -158,6 +158,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 quant_config,
                 f"{prefix}.shared_expert.down_proj",
             )
+            # A quantization method with packed transforms (EXL3) declares the
+            # block size its TP cuts must preserve; a partition that is not a
+            # whole number of blocks replicates the shared expert instead.
+            shared_expert_group_size = getattr(
+                quant_config,
+                "shared_expert_shard_group_size",
+                shared_expert_group_size,
+            )
             self.replicate_shared_expert = _should_replicate_misaligned_shared_expert(
                 config.shared_expert_intermediate_size,
                 self.tp_size,

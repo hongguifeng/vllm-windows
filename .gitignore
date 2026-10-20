@@ -261,3 +261,8 @@ _dev/out/
 # the `morrow` remote.
 _dev/fork_cmp170hx/patches/
 _dev/fork_cmp170hx/fork_commits.txt
+
+.pi/
+# Local scratch area (spike builds, recipe sources) and editor leftovers.
+_scratch/
+_dev/bin/*.orig

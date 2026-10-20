@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -876,7 +877,11 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             )
         # Checked again in Qwen4ExpModelState; rejecting it here keeps the
         # engine from loading weights first.
-        if text_config.ple_layer_ids and parallel_config.pipeline_parallel_size > 1:
+        if (
+            text_config.ple_layer_ids
+            and parallel_config.pipeline_parallel_size > 1
+            and not os.environ.get("VLLM_PLE_ALLOW_PP")
+        ):
             raise NotImplementedError(
                 "Qwen4Exp N-gram PLE embedding requires pipeline_parallel_size=1 "
                 "because non-first pipeline ranks do not receive the raw input_ids "

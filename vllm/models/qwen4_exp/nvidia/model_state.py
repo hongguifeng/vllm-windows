@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-runner state for Qwen4Exp PLE inputs."""
 
+import os
 from typing import Any
 
 import torch
@@ -48,7 +49,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
             self.ngram_eos_token_id = 0
             return
 
-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+        if (
+            vllm_config.parallel_config.pipeline_parallel_size > 1
+            and not os.environ.get("VLLM_PLE_ALLOW_PP")
+        ):
             raise RuntimeError(
                 "N-gram PLE embedding currently requires "
                 "pipeline_parallel_size=1 because non-first pipeline ranks do "

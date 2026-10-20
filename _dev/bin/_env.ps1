@@ -1,15 +1,36 @@
-$ErrorActionPreference = 'Continue'
+﻿$ErrorActionPreference = 'Continue'
 
 $REPO    = 'D:\code\vllm-windows'
 $DEV     = "$REPO\_dev"      # 本地脚本/文档/输出的唯一落点（bin|bench|test|probe|patches|docs|out）
-$MSVC    = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207'
+
+# Toolset / SDK / CUDA are discovered, not pinned: a stale version silently leaves
+# nvcc without a host compiler ("nvcc fatal : Cannot find compiler 'cl.exe' in PATH").
+function _LatestDir([string]$root, [string]$leaf) {
+    if (-not (Test-Path -LiteralPath $root)) { return $null }
+    $c = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+         Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName $leaf) }
+    $c = $c | Sort-Object { try { [Version]$_.Name } catch { $_.Name } } -Descending
+    if ($c) { return $c[0].FullName }
+    return $null
+}
+
+$VSROOT  = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools'
+$vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+if (Test-Path -LiteralPath $vswhere) {
+    $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    if ($found) { $VSROOT = "$found".Trim() }
+}
+$MSVC    = _LatestDir "$VSROOT\VC\Tools\MSVC" 'bin\Hostx64\x64\cl.exe'
+if (-not $MSVC) { $MSVC = "$VSROOT\VC\Tools\MSVC\14.44.35207" }
 $SDKROOT = 'C:\Program Files (x86)\Windows Kits\10'
-$SDKVER  = '10.0.26100.0'
-$CUDAROOT= 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3'
+$sdkDir  = _LatestDir "$SDKROOT\Include" 'um'
+if ($sdkDir) { $SDKVER = Split-Path -Leaf $sdkDir } else { $SDKVER = '10.0.26100.0' }
+$cudaDir = _LatestDir 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA' 'bin\nvcc.exe'
+if ($cudaDir) { $CUDAROOT = $cudaDir } else { $CUDAROOT = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3' }
 
 $env:CODEBUDDY_SAFE_DELETE_ENABLED = '0'
 $env:VCToolsInstallDir  = "$MSVC\"
-$env:VCToolsVersion     = '14.44.35207'
+$env:VCToolsVersion     = Split-Path -Leaf $MSVC
 $env:WindowsSdkDir      = "$SDKROOT\"
 $env:WindowsSDKVersion  = "$SDKVER\"
 $env:UCRTVersion        = $SDKVER

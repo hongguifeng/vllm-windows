@@ -2497,3 +2497,11 @@ def compile_factors() -> dict[str, object]:
         factors[var] = normalize_value(os.getenv(var))
 
     return factors
+
+
+# The sm_80 fork's variables (currently the EXL3 set) are declared in
+# vllm/sm80/envs.py and added here, last, so a name that upstream vLLM starts
+# declaring is reported instead of silently shadowed.
+from vllm.sm80.envs import register_env_vars as _register_sm80_env_vars
+
+_register_sm80_env_vars(environment_variables)
