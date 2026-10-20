@@ -895,6 +895,9 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
             "mtp",
             "ngram",
             "ngram_gpu",
+            # A DFlash drafter attaches through the Eagle3 capture this model
+            # exposes (Qwen4ExpModel._aux_hidden_state).
+            "dflash",
         }:
             raise NotImplementedError(
                 "Qwen4Exp speculative decoding supports only its native MTP "
