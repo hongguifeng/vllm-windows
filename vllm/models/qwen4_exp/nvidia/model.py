@@ -11,6 +11,7 @@ from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
@@ -68,7 +69,6 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
-from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
@@ -524,9 +524,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                 ple_layer = layer_idx
                 picks.add(layer_idx)
                 break
-        qsa = sorted(
-            self._qsa_layer_ids & set(range(self.start_layer, self.end_layer))
-        )
+        qsa = sorted(self._qsa_layer_ids & set(range(self.start_layer, self.end_layer)))
         if qsa:
             picks.update((qsa[0], qsa[-1]))
 
@@ -709,7 +707,9 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
 
         if self.end_layer in self.aux_hidden_state_layers:
             aux_hidden_states.append(
-                self._aux_hidden_state(hidden_states, block_output, injection, prev_layer)
+                self._aux_hidden_state(
+                    hidden_states, block_output, injection, prev_layer
+                )
             )
 
         # The final mixer consumes the last pending combine and returns both
@@ -748,7 +748,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
         )
         # Non-persistent PLE state rebuilt in __init__; skip any ckpt
         # column for them.
-        skip_substrs = (
+        skip_substrs: tuple[str, ...] = (
             "hashstats_",
             "token_lookup",
             "hyper_connection_mixer.block_inject_weight",
