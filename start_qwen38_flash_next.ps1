@@ -34,6 +34,19 @@ param(
     [int]$MaxNumPartialPrefills = 0,
     [double]$MemUtil = 0.96,
     [int]$KvGiB = 0,
+    # KV block size and prefix-cache match unit. 1680/16 measured +7% at one user
+    # and +13% at four on one 170HX with MTP-3 (_dev/docs/
+    # FLASHNEXT_SINGLE_CARD_ACCEL_2026-10-21.md). -BlockSize 0 -PrefixMatchUnit 0
+    # restores the engine's own choice.
+    [int]$BlockSize = 1680,
+    [int]$PrefixMatchUnit = 16,
+    # Host-RAM KV tier (GiB) for contexts evicted from the card, and where its
+    # backing file lives on Windows. 16 GiB measured working end to end: blocks
+    # evicted to it come back on a prefix hit (11,600 of 11,612 cached tokens,
+    # identical greedy output), a reload instead of a re-prefill. It buys reuse,
+    # not concurrency. -KvOffloadGb 0 leaves the tier off.
+    [int]$KvOffloadGb = 16,
+    [string]$KvOffloadDir = 'D:\vllm-offload',
     # Empty (default) = production behaviour unchanged. Bracketed list reproduces
     # the WSL arm's explicit CUDA-graph capture coverage.
     [string]$CaptureSizes = '',
@@ -121,6 +134,12 @@ if ($PrefillChunkWithDecodes -gt 0) {
 }
 if ($MaxNumPartialPrefills -gt 0) {
     $args += @('-MaxNumPartialPrefills', "$MaxNumPartialPrefills")
+}
+if ($BlockSize -gt 0) { $args += @('-BlockSize', "$BlockSize") }
+if ($PrefixMatchUnit -gt 0) { $args += @('-PrefixMatchUnit', "$PrefixMatchUnit") }
+if ($KvOffloadGb -gt 0) {
+    $args += @('-KvOffloadGb', "$KvOffloadGb")
+    if ($KvOffloadDir) { $args += @('-KvOffloadDir', $KvOffloadDir) }
 }
 if (-not $NoGraphs) { $args += '-Graphs' }
 if ($NoAllocHeal) { $args += '-NoAllocHeal' }

@@ -45,6 +45,12 @@ param(
     [int]$MaxLen = 4096,
     [int]$MaxSeqs = 4,
     [int]$BatchedTokens = 2048,
+    # KV block size and the prefix-cache match unit. 1680 with unit 16 measured
+    # +13% at four concurrent on one 170HX (_dev/docs/FLASHNEXT_SINGLE_CARD_ACCEL_2026-10-21.md);
+    # 1680 is a multiple of 16 and of the QSA ring for wider draft counts.
+    # 0 leaves each at the engine's own choice.
+    [int]$BlockSize = 0,
+    [int]$PrefixMatchUnit = 0,
     # Fair chunked prefill (both default 0 = upstream scheduling). A positive
     # -PrefillChunkWithDecodes caps the prefill tokens issued per step whenever
     # something is decoding, which is what keeps co-resident decode latency down
@@ -54,6 +60,14 @@ param(
     [double]$MemUtil = 0.96,
     [string]$LoadStrategy = '',
     [long]$KvGiB = 0,
+    # Host-RAM KV tier for contexts evicted from the cards. It pays for reuse (a
+    # reload is about a second against re-prefilling at ~3.3k tok/s), not for
+    # concurrency: admission is still bounded by the GPU block pool. On Windows
+    # it is a real file under -KvOffloadDir, so it costs disk, not committed
+    # memory. Same default as start_qwen38_flash_next.ps1; -KvOffloadGb 0 turns
+    # it off.
+    [int]$KvOffloadGb = 16,
+    [string]$KvOffloadDir = 'D:\vllm-offload',
     [switch]$FullWeights,
     [switch]$PleSsd,
     [int]$PleDepth = 256,
@@ -309,6 +323,22 @@ if ($KvGiB -gt 0) {
     $kvBytes = [long]($KvGiB * 1GB)
     $argv += @('--kv-cache-memory-bytes', "$kvBytes")
 }
+if ($BlockSize -gt 0) {
+    $argv += @('--block-size', "$BlockSize")
+}
+if ($KvOffloadGb -gt 0) {
+    if ($KvOffloadDir) {
+        # Windows backs the tier with a real file; keep it off the system drive.
+        $env:VLLM_OFFLOAD_REGION_DIR = $KvOffloadDir
+    }
+    $tierBytes = [long]($KvOffloadGb * 1GB)
+    $kv = '{"kv_connector": "OffloadingConnector", "kv_role": "kv_both", ' +
+        '"kv_connector_extra_config": {"cpu_bytes_to_use": ' + $tierBytes + '}}'
+    $argv += @('--kv-transfer-config', (EscJson $kv))
+}
+if ($PrefixMatchUnit -gt 0) {
+    $argv += @('--prefix-match-unit', "$PrefixMatchUnit")
+}
 if ($IterDetails) {
     $argv += @('--enable-logging-iteration-details')
 }
@@ -360,7 +390,15 @@ if ($Mtp) {
         }
         $spec = '{"method": "mtp", "num_speculative_tokens": ' + $MtpTokens +
             ', "adaptive_k": {"min": 1, "max": ' + $AdaptiveK +
-            ', "log_interval": 200}}'
+            ', "log_interval": 200}'
+        if ($KvOffloadGb -gt 0) {
+            # Offloading a drafter's blocks needs block drop disabled (vLLM #52735).
+            $spec += ', "disable_eagle_block_drop": true'
+        }
+        $spec += '}'
+    }
+    elseif ($KvOffloadGb -gt 0) {
+        $spec = $spec.TrimEnd('}') + ', "disable_eagle_block_drop": true}'
     }
     $argv += @('--speculative-config', (EscJson $spec))
 }
