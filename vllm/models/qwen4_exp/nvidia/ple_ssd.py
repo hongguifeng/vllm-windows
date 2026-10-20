@@ -296,6 +296,7 @@ class PLESSDTable:
         cache_mb: int = 128,
         native_library: str | None = None,
         io_depth: int = 256,
+        owner: tuple[int, int] | None = None,
     ) -> None:
         if workers < 1 or cache_mb < 0:
             raise ValueError(
@@ -303,6 +304,12 @@ class PLESSDTable:
             )
         self.row_bytes = dim * 2
         self.rows = rows
+        # Rows outside this rank's ETP range belong to another rank: they are
+        # never read from disk and never cached here, only zero-filled for the
+        # reduce that reassembles the whole table.
+        self.owner = (0, rows) if owner is None else owner
+        self._zero_row = bytes(self.row_bytes)
+        self.foreign_occ = 0
         self.workers = workers
         self.cache_limit = cache_mb * 1024 * 1024 // (self.row_bytes + 128)
         self.cache: OrderedDict[int, bytes] = OrderedDict()
@@ -448,7 +455,13 @@ class PLESSDTable:
         found = {}
         missing = []
         hit_occ = miss_occ = 0
+        owner_start, owner_end = self.owner
+        foreign_occ = 0
         for row, count in zip(row_ids, counts.tolist()):
+            if row < owner_start or row >= owner_end:
+                found[row] = self._zero_row
+                foreign_occ += int(count)
+                continue
             cached = self.cache.get(row)
             if cached is None:
                 missing.append(row)
@@ -457,6 +470,7 @@ class PLESSDTable:
                 found[row] = cached
                 self.cache.move_to_end(row)
                 hit_occ += int(count)
+        self.foreign_occ += foreign_occ
         self.hits += len(found)
         self.reads += len(missing)
         if prefetch:
@@ -568,13 +582,18 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
 
     def __init__(self, *args, **kwargs) -> None:
         config = get_current_vllm_config()
-        if config.parallel_config.tensor_parallel_size != 1 or (
-            config.parallel_config.data_parallel_size != 1
-        ):
-            raise ValueError("PLE SSD offload currently requires TP=DP=1")
+        if config.parallel_config.data_parallel_size != 1:
+            raise ValueError("PLE SSD offload requires data_parallel_size=1")
         super().__init__(*args, **kwargs)
         if self.weight.dtype != torch.bfloat16:
             raise ValueError("PLE SSD offload currently requires BF16 embeddings")
+        if self.etp_data_parallel_size != 1:
+            raise ValueError("PLE SSD offload requires ETP not to span DP")
+        # Every vocabulary row has one owner, so a rank streams only the rows in
+        # its ETP range and zero-fills the rest; _reduce_etp_embeddings sums the
+        # owners' rows back into the full embedding.
+        self.row_start = self.shard_indices.org_vocab_start_index
+        self.row_end = self.shard_indices.org_vocab_end_index
         options = config.additional_config
         self._table = PLESSDTable(
             config.model_config.model,
@@ -585,6 +604,7 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
             int(options.get("ple_ssd_cache_mb", 128)),
             options.get("ple_ssd_native_library"),
             int(options.get("ple_ssd_io_depth", 256)),
+            owner=(self.row_start, self.row_end),
         )
         self.prompt_prefetcher: PLEPromptPrefetcher | None = None
         self._device = torch.device("cuda", torch.cuda.current_device())
@@ -639,8 +659,13 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
             logger.info("PLE SSD ids wait polls instead of blocking on the event")
         self._loaded_starts: set[int] = set()
         logger.info(
-            "PLE SSD: %.2f GiB on disk, %d I/O workers, %d MiB row cache",
+            "PLE SSD: %.2f GiB on disk, %.2f GiB in rows [%d, %d) of %d, "
+            "%d I/O workers, %d MiB row cache",
             self.org_vocab_size * self._table.row_bytes / 2**30,
+            (self.row_end - self.row_start) * self._table.row_bytes / 2**30,
+            self.row_start,
+            self.row_end,
+            self.org_vocab_size,
             self._table.workers,
             int(options.get("ple_ssd_cache_mb", 128)),
         )
@@ -929,7 +954,8 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
             table.lookahead_hit_rows = 0
             table.lookahead_miss_rows = 0
         torch.cuda.current_stream().wait_event(self._copy_ready)
-        output.copy_(self._gpu[: output.shape[0]].flatten(-2))
+        embeddings = self._gpu[: output.shape[0]].flatten(-2)
+        output.copy_(self._reduce_etp_embeddings(embeddings))
         self._previous_use.record()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
