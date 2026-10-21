@@ -8,6 +8,33 @@ RAM 只有 87.9 GiB、表是 BF16 95.37 GiB 而暂缓，本轮做 P2–P5。
 spec 计数取自 `/metrics` 增量），每次 200/128 token、temperature 0、ignore_eos。
 基线是生产 `:9393`（MTP-3 + adaptive_k 1–3，默认 block）。
 
+## 0. 启动器开关（2026-10-21 晚，多实例 + DFlash）
+
+`start_qwen38_flash_next.ps1` 与 `_dev/bin/_flashnext_struct_serve.ps1` 新增：
+
+| 开关 | 默认 | 作用 |
+| --- | --- | --- |
+| `-Spec auto\|mtp\|dflash\|none` | `auto`（跟随 `-Mtp`，即生产行为不变） | 选投机方法；`dflash` 用外部 DFlash 2 drafter |
+| `-Drafter <path>` | `D:\models\Qwen3.8-Flash-Next-DFlash2` | drafter 目录 |
+| `-DflashDrafts <n>` | `7` | dflash 每步草稿数（忽略 `-MtpTokens`/`-AdaptiveK`） |
+| `-KvOffloadDir <path>` | 空 = `D:\vllm-offload\<Port>` | **每个实例自己的 tier 目录** |
+
+多实例 KV offload：tier 的 region 文件挂在 `VLLM_OFFLOAD_REGION_DIR` 下，启动时只清理
+**自己目录**里的陈旧 region；不同端口的实例各占一个目录，互不可见也不可能互删。实测两个
+实例同时开 16 GiB tier：`D:\vllm-offload\`（旧默认，生产在跑）与
+`D:\vllm-offload\9402\`，各 15.98 GB，两个服务同时 `health=200`。想共享一份
+content-addressed 缓存时显式传同一个 `-KvOffloadDir` 即可。
+
+两个踩过的坑（已修）：
+
+1. **`$spec` 与参数 `$Spec` 在 PowerShell 里是同一个变量**（大小写不敏感），赋值被
+   `ValidateSet` 拦掉，导致命令行里出现 `--speculative-config dflash` 被 python 拒收。
+   局部变量改名 `$specJson`。
+2. **DFlash 会触发 flashinfer JIT**（`run_ninja`），而生产启动路径没把 MSVC/ninja 放进
+   PATH，engine 以 `FileNotFoundError [WinError 2]` 退出。前端脚本现在 source
+   `_dev/bin/_env.ps1` 并设 `VSLANG=1033`（否则中文编译器日志会在 JIT 里触发
+   `UnicodeDecodeError`），同时把 venv 的 `Scripts` 加进 PATH。
+
 ---
 
 ## 1. 基线（更正之前的口径错误）
@@ -15,16 +42,16 @@ spec 计数取自 `/metrics` 增量），每次 200/128 token、temperature 0、
 `_dev/probe/_bench_port.py` 数的是流式 chunk，不是 token，之前报的 42/108 tok/s 偏低。
 
 | 臂 | c1 | c4 聚合 | c1 步时 | c4 步时 | 接受/步 |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | 生产 MTP-3 + adaptive_k | **106.8** | **287.3** | 23.1 ms | 34.9 ms | 1.49 / 2.09 |
-| 冷 prefill（4096 tok，唯一 prompt） | 1.26 s ≈ **3,250 tok/s** | | | | |
+| 冷 prefill（4096 tok，唯一 prompt） | 1.26 s ≈ **3,250 tok/s** | — | — | — | — |
 
 ## 2. P2｜DFlash 2 草稿模型
 
 移植内容（与配方同源，48 行）：
 
 | 文件 | 改动 |
-|---|---|
+| --- | --- |
 | `vllm/models/qwen4_exp/nvidia/model.py` | `Qwen4ExpModel` 加 `EagleModelMixin`；新增 `_aux_hidden_state()`（层前状态、四路超连接平均）；forward 收集 `aux_hidden_state_layers` 并在有 drafter 时返回 `(hidden, aux)`；两个 LM 类加 `SupportsEagle3` |
 | `vllm/model_executor/models/config.py` | 投机方法白名单加 `dflash` |
 | `vllm/v1/worker/gpu/model_runner.py` | `get_mtp_target_hidden_states()` 返回 None 时不再切片（两处）；否则 DFlash 在 profiling 阶段崩 `'NoneType' object is not subscriptable` |
@@ -36,7 +63,7 @@ drafter：`D:\models\Qwen3.8-Flash-Next-DFlash2`（incoai，revision `a22a1744`�
 30–70%，已作废**；下表是两臂各自独占机器重测的干净数字（真实文本用仓内代码文件与中文文档）：
 
 | 负载 | MTP-3 c1 | DFlash-7 c1 | MTP-3 c4 | DFlash-7 c4 |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | 代码（英文 Python） | 134.7 | **157.6（+17%）** | **346.0** | 293.3（−15%） |
 | 中文散文 | **105.9** | 86.3（−19%） | **249.1** | 169.7（−32%） |
 | 重复填充文本 | 112.9 | 111（持平） | 317.6 | — |
@@ -65,7 +92,7 @@ DFlash 每步产出更多 token（代码 c1 3.34 接受/步、4.27 tok/步），
 **③ 差在同草稿数下的接受率**（代码文本、c1、两臂独占机器）：
 
 | 配置 | 接受率 | 接受/步 | tok/步 | 步时 | tok/s |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | MTP-3（生产） | **69.9%** | 2.08 | 3.08 | 22.8 ms | **134.7** |
 | DFlash-3 | 60.6% | 1.82 | 2.82 | 23.9 ms | 117.7 |
 | DFlash-7 | 35.1% | 2.46 | 3.39 | 27.1 ms | 124.7 |
@@ -99,7 +126,7 @@ Merlin W4A16 权重上训练的，我们这里是另一套量化，隐藏态分�
 ## 4. P4｜便宜参数（本轮唯一明确的单卡提速）
 
 | 配置 | c1 | c4 聚合 | c1 步时 | c4 步时 |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | 生产：默认 block、batched 2048 | 106.8 | 287.3 | 23.1 ms | 34.9 ms |
 | 固定 k=3、默认 block | 106.8 | 289.7 | 23.7 ms | 36.9 ms |
 | **`--block-size 1680 --prefix-match-unit 16`**、固定 k=3 | **110.7** | **329.0** | 22.6 ms | 31.2 ms |
@@ -117,12 +144,13 @@ Merlin W4A16 权重上训练的，我们这里是另一套量化，隐藏态分�
 ## 5. P5｜KV offload 到主机内存 tier（已完成 Windows 移植）
 
 原实现用 POSIX 共享内存（`/dev/shm/vllm_offload_{id}.mmap` + `MADV_POPULATE_WRITE`
-+ `st_nlink` + “映射后立即 unlink”），Windows 上直接 `FileNotFoundError`。
+
+- `st_nlink` + “映射后立即 unlink”），Windows 上直接 `FileNotFoundError`。
 
 改动只在 `vllm/v1/kv_offload/cpu/shared_offload_region.py`（其余 6 个文件无 POSIX 依赖）：
 
 | 点 | Windows 处理 |
-|---|---|
+| --- | --- |
 | 路径 | `%TEMP%\vllm_offload_{id}.mmap`（`tempfile.gettempdir()`） |
 | 映射 | `mmap.mmap(fd, size)`（无 `MAP_SHARED`/`prot` 参数，句柄即共享） |
 | 预触页 | 无 `madvise` → 直接用已有的逐页写回退路径 |
@@ -136,7 +164,7 @@ join 后能看到第一个写的字节、写回双向可见、`cleanup()` 删除
 
 端到端（GPU2，`--kv-transfer-config` 16 GiB tier，MTP+1680，`health=200`）：
 
-```
+```text
 Created mmap file C:\Users\hong\AppData\Local\Temp\vllm_offload_<id>.mmap (17.16 GB)
 vllm:kv_offload_total_bytes_total{transfer_type="GPU_to_CPU"} 6.92e8   # 692 MB 已下沉
 vllm:kv_offload_total_bytes_total{transfer_type="CPU_to_GPU"} 0.0      # 未触发回填
@@ -147,7 +175,7 @@ WARNING cudaHostRegister failed for rank=0 at 0.00 of 17.16 GB (code=2); the off
 - **回填路径已验证**（`_dev/probe/_kv_offload_reload_test.py`；GPU 池压到 36,764 token、
   tier 16 GiB、`max-model-len 32768`，三个 11.6k/19.8k/7.1k token 的不同 prompt 把池挤爆）：
 
-  ```
+  ```text
   tier after filling: GPU_to_CPU 2214.1 MB, CPU_to_GPU 0.0 MB
   pass 2（原 prompt 再问一次）: cached 11600 / 11612 token
   tier refill during pass 2: 507.4 MB        ← 命中来自主机 tier，不是重算
@@ -166,7 +194,6 @@ WARNING cudaHostRegister failed for rank=0 at 0.00 of 17.16 GB (code=2); the off
 结论：**P5 移植完成，驱逐与回填都验证过**，可作容量特性使用。上生产前只剩两个决策：
 `KV_OFFLOAD_GB` 开多大（16 GiB 约合数十万 token 的额外容量，占 `%TEMP%` 所在盘），以及能否接受
 可分页带来的传输开销（未 pin）。
-
 
 ## 6. 下一步建议
 
@@ -187,8 +214,8 @@ WARNING cudaHostRegister failed for rank=0 at 0.00 of 17.16 GB (code=2); the off
 
 重启后实测（`health=200`，冷启动 242 s）：
 
-| | 改前 | 改后 | 变化 |
-|---|---:|---:|---:|
+| 指标 | 改前 | 改后 | 变化 |
+| --- | ---: | ---: | ---: |
 | c1 | 106.8 | **112.9** | +5.7% |
 | c4 聚合 | 287.3 | **317.6** | +10.6% |
 | c4 单请求延迟 | 1.61 s | 1.56 s | −3% |
@@ -202,7 +229,7 @@ WARNING cudaHostRegister failed for rank=0 at 0.00 of 17.16 GB (code=2); the off
 生产服务用的是 `.flashnext-root\.venv\Lib\site-packages\vllm`（2026-10-01 装进去的拷贝），
 改仓库 `vllm/` 下的文件对它**没有影响**。第一次带 tier 重启就是这样失败的：
 
-```
+```text
 FileNotFoundError: [Errno 2] No such file or directory: '/dev/shm/vllm_offload_...mmap'
 ```
 
@@ -224,7 +251,7 @@ FileNotFoundError: [Errno 2] No such file or directory: '/dev/shm/vllm_offload_.
 
 ### 7.2 当前生产配置（2026-10-21 03:02 重启）
 
-```
+```text
 --block-size 1680 --prefix-match-unit 16
 --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both",
                       "kv_connector_extra_config":{"cpu_bytes_to_use":17179869184}}

@@ -67,7 +67,12 @@ param(
     # memory. Same default as start_qwen38_flash_next.ps1; -KvOffloadGb 0 turns
     # it off.
     [int]$KvOffloadGb = 16,
-    [string]$KvOffloadDir = 'D:\vllm-offload',
+    # Empty (default) derives <base>\<Port>, so two instances on one host each
+    # own their region file and their disk cache instead of sharing one
+    # directory: the tier's startup sweep only touches its own directory, and a
+    # per-instance path cannot be reclaimed while another instance still maps
+    # it. Pass an explicit directory to share a content-addressed cache.
+    [string]$KvOffloadDir = '',
     [switch]$FullWeights,
     [switch]$PleSsd,
     [int]$PleDepth = 256,
@@ -103,6 +108,14 @@ param(
     [string]$CaptureSizes = '',
     [switch]$Mtp,
     [int]$MtpTokens = 1,
+    # Speculation method. 'auto' follows -Mtp (mtp when set, none otherwise), so
+    # existing callers keep their behaviour. 'dflash' serves an external DFlash 2
+    # drafter from -Drafter; it ignores -MtpTokens/-AdaptiveK and drafts
+    # -DflashDrafts tokens per step in a single pass.
+    [ValidateSet('auto', 'mtp', 'dflash', 'none')]
+    [string]$Spec = 'auto',
+    [string]$Drafter = 'D:\models\Qwen3.8-Flash-Next-DFlash2',
+    [int]$DflashDrafts = 7,
     # -AdaptiveK turns on the acceptance-adaptive draft count: the scheduler
     # picks this step's verification width from the running requests' recent
     # acceptance instead of always using -MtpTokens. Value is the maximum count
@@ -327,10 +340,12 @@ if ($BlockSize -gt 0) {
     $argv += @('--block-size', "$BlockSize")
 }
 if ($KvOffloadGb -gt 0) {
-    if ($KvOffloadDir) {
-        # Windows backs the tier with a real file; keep it off the system drive.
-        $env:VLLM_OFFLOAD_REGION_DIR = $KvOffloadDir
+    if (-not $KvOffloadDir) { $KvOffloadDir = "D:\vllm-offload\$Port" }
+    if (-not (Test-Path -LiteralPath $KvOffloadDir)) {
+        New-Item -ItemType Directory -Force -Path $KvOffloadDir | Out-Null
     }
+    # Windows backs the tier with a real file; keep it off the system drive.
+    $env:VLLM_OFFLOAD_REGION_DIR = $KvOffloadDir
     $tierBytes = [long]($KvOffloadGb * 1GB)
     $kv = '{"kv_connector": "OffloadingConnector", "kv_role": "kv_both", ' +
         '"kv_connector_extra_config": {"cpu_bytes_to_use": ' + $tierBytes + '}}'
@@ -381,26 +396,39 @@ if ($NSys) {
     $env:VLLM_ENABLE_V1_MULTIPROCESSING = '0'
     $argv += @('--profiler-config.profiler', 'cuda')
 }
-if ($Mtp) {
+$specMethod = $Spec
+if ($specMethod -eq 'auto') { $specMethod = if ($Mtp) { 'mtp' } else { 'none' } }
+if ($specMethod -eq 'dflash' -and -not (Test-Path -LiteralPath "$Drafter\config.json")) {
+    throw "Drafter checkpoint not found: $Drafter\config.json"
+}
+if ($specMethod -eq 'mtp') {
     if ($AdaptiveK -lt 0) { $AdaptiveK = $MtpTokens }
-    $spec = '{"method": "mtp", "num_speculative_tokens": ' + $MtpTokens + '}'
+    $specJson = '{"method": "mtp", "num_speculative_tokens": ' + $MtpTokens + '}'
     if ($AdaptiveK -gt 0) {
         if ($AdaptiveK -gt $MtpTokens) {
             throw "-AdaptiveK ($AdaptiveK) cannot exceed -MtpTokens ($MtpTokens)"
         }
-        $spec = '{"method": "mtp", "num_speculative_tokens": ' + $MtpTokens +
+        $specJson = '{"method": "mtp", "num_speculative_tokens": ' + $MtpTokens +
             ', "adaptive_k": {"min": 1, "max": ' + $AdaptiveK +
             ', "log_interval": 200}'
         if ($KvOffloadGb -gt 0) {
             # Offloading a drafter's blocks needs block drop disabled (vLLM #52735).
-            $spec += ', "disable_eagle_block_drop": true'
+            $specJson += ', "disable_eagle_block_drop": true'
         }
-        $spec += '}'
+        $specJson += '}'
     }
     elseif ($KvOffloadGb -gt 0) {
-        $spec = $spec.TrimEnd('}') + ', "disable_eagle_block_drop": true}'
+        $specJson = $specJson.TrimEnd('}') + ', "disable_eagle_block_drop": true}'
     }
-    $argv += @('--speculative-config', (EscJson $spec))
+    $argv += @('--speculative-config', (EscJson $specJson))
+}
+elseif ($specMethod -eq 'dflash') {
+    $drafterPath = $Drafter -replace '\\', '/'
+    $specJson = '{"method": "dflash", "model": "' + $drafterPath +
+        '", "num_speculative_tokens": ' + $DflashDrafts
+    if ($KvOffloadGb -gt 0) { $specJson += ', "disable_eagle_block_drop": true' }
+    $specJson += '}'
+    $argv += @('--speculative-config', (EscJson $specJson))
 }
 if ($AsyncSched) {
     # Overlap the CPU side of a step with the GPU side; worth it when a step is
@@ -480,7 +508,7 @@ Write-Host ("mode   : " + $(if ($Graphs) { 'CUDA graphs' } else { 'enforce-eager
             } else { '' }) +
             $(if ($FullWeights) { '  full weights' } else { '  PLE-free view' }) +
             $(if ($PleSsd) { "  + PLE SSD (ask $PleDepth, $PleCacheMb MiB cache, $PleWorkers workers" + $(if ($PlePrefetchTokens -gt 0) { ", prefetch $PlePrefetchTokens" } else { '' }) + ')' } else { '' }) +
-            $(if ($Mtp) { "  + MTP x$MtpTokens" } else { '' }) +
+            $(if ($specMethod -eq 'mtp') { "  + MTP x$MtpTokens" } elseif ($specMethod -eq 'dflash') { "  + DFlash2 x$DflashDrafts" } else { '' }) +
             $(if ($AsyncSched) { '  + async scheduling' } else { '' }) +
             $(if ($NoTools) { '   tools OFF' } else { "  + tools ($ToolParser)" }) +
             $(if ($NoReasoningParser) { '  no reasoning parser' } else { '  + reasoning qwen3' }) +
@@ -489,7 +517,7 @@ Write-Host ("mode   : " + $(if ($Graphs) { 'CUDA graphs' } else { 'enforce-eager
 Write-Host ("limits : $MaxLen ctx, $MaxSeqs seqs, $BatchedTokens batched tokens, util $MemUtil" +
     $(if ($PrefillChunkWithDecodes -gt 0) { ", prefill chunk w/ decodes $PrefillChunkWithDecodes" } else { '' }) +
     $(if ($MaxNumPartialPrefills -gt 0) { ", partial prefills $MaxNumPartialPrefills" } else { '' }) +
-    $(if ($Mtp -and $AdaptiveK -gt 0) { ", adaptive k<=$AdaptiveK" } else { ', fixed k' }) +
+    $(if ($specMethod -eq 'mtp' -and $AdaptiveK -gt 0) { ", adaptive k<=$AdaptiveK" } elseif ($specMethod -eq 'dflash') { ", fixed k=$DflashDrafts" } else { ', fixed k' }) +
             $(if ($KvGiB -gt 0) { ", KV $KvGiB GiB fixed" } else { '' }) +
             $(if ($LoadStrategy) { ", load $LoadStrategy" } else { '' }) +
             $(if ($NoAllocHeal) { ', alloc-heal OFF' } else { ", alloc-heal free<$($env:QSA_ALLOC_HEAL_FREE_MB)MiB cached>$($env:QSA_ALLOC_HEAL_CACHED_MB)MiB" }))

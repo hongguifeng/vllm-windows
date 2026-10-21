@@ -46,7 +46,11 @@ param(
     # identical greedy output), a reload instead of a re-prefill. It buys reuse,
     # not concurrency. -KvOffloadGb 0 leaves the tier off.
     [int]$KvOffloadGb = 16,
-    [string]$KvOffloadDir = 'D:\vllm-offload',
+    # Empty (default) means <base>\<Port>: every instance gets its own tier
+    # directory, so two services on one host (e.g. production on 9393 and an
+    # experiment on 9402) can both run KV offload without sharing a region file
+    # or a cache directory. Pass an explicit path to share one.
+    [string]$KvOffloadDir = '',
     # Empty (default) = production behaviour unchanged. Bracketed list reproduces
     # the WSL arm's explicit CUDA-graph capture coverage.
     [string]$CaptureSizes = '',
@@ -60,6 +64,15 @@ param(
     [int]$PleWorkers = 16,
     [int]$PlePrefetchTokens = 16384,
     [int]$MtpTokens = 3,
+    # Speculation method. 'auto' (default) keeps production on its native MTP
+    # head; 'dflash' serves inco.ai's DFlash 2 drafter instead, which drafts
+    # -DflashDrafts tokens in one pass and ignores -MtpTokens/-AdaptiveK.
+    # Measured on one 170HX: DFlash wins only for single-user code, MTP wins on
+    # Chinese prose and at 2+ users (_dev/docs/FLASHNEXT_SINGLE_CARD_ACCEL_2026-10-21.md).
+    [ValidateSet('auto', 'mtp', 'dflash', 'none')]
+    [string]$Spec = 'auto',
+    [string]$Drafter = 'D:\models\Qwen3.8-Flash-Next-DFlash2',
+    [int]$DflashDrafts = 7,
     # Acceptance-adaptive draft count. Default -1 means "follow -MtpTokens",
     # i.e. the feature is on. Pass 0 to turn it off, which keeps speculative
     # decoding byte-identical to a fixed draft count. Value is the maximum
@@ -95,6 +108,16 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = 'D:\code\vllm-windows'
 $launcher = "$repo\_dev\bin\_flashnext_struct_serve.ps1"
+
+# Some engine paths JIT-compile flashinfer kernels (a DFlash drafter reaches one
+# that MTP never does), and that build shells out to ninja and cl.exe. Source the
+# toolchain environment so every instance inherits it, and pin the compiler log
+# to English: flashinfer reads it with text=True, and a GBK locale raises
+# UnicodeDecodeError inside the build.
+$envScript = "$repo\_dev\bin\_env.ps1"
+if (Test-Path -LiteralPath $envScript) { . $envScript }
+$env:VSLANG = '1033'
+$env:PATH = "$Venv\.venv\Scripts;$env:PATH"
 
 # -Unc swaps the default checkpoint to the AutoRound Uncensored build and
 # gives it a distinct served name so clients can tell it apart from the censored
@@ -151,6 +174,12 @@ $args += @('-MaxPixels', "$MaxPixels")
 $args += @('-MaxImages', "$MaxImages")
 if (-not $NoMtp) { $args += @('-Mtp', '-MtpTokens', "$MtpTokens") }
 if ($AdaptiveK -ne -1) { $args += @('-AdaptiveK', "$AdaptiveK") }
+# The method is explicit whenever it is not the production default, so -NoMtp
+# still means "no speculation" and -Spec dflash overrides the MTP flags above.
+if ($Spec -ne 'auto') { $args += @('-Spec', $Spec) }
+if ($Spec -eq 'dflash') {
+    $args += @('-Drafter', $Drafter, '-DflashDrafts', "$DflashDrafts")
+}
 if ($Async -and -not $NoAsync) { $args += '-AsyncSched' }
 if ($NoTools) { $args += '-NoTools' }
 if ($NoReasoningParser) { $args += '-NoReasoningParser' }
