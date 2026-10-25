@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from contextlib import nullcontext
 from enum import IntEnum
 
 import torch
@@ -20,6 +21,21 @@ from vllm.v1.worker.ubatching import (
 )
 
 logger = init_logger(__name__)
+
+
+def _thin_gemm_lane(lane: int):
+    """Workspace lane for the thin GEMMs the aux stream enqueues.
+
+    The sm_80 thin-M BF16 GEMM keeps its split-K partials per lane; the shared
+    expert runs on a second stream while the main stream is busy, so it needs a
+    lane of its own. A no-op when ``VLLM_THIN_GEMM`` is off, and it imports
+    nothing then.
+    """
+    if not envs.VLLM_THIN_GEMM:
+        return nullcontext()
+    from vllm.sm80.kernels.thin_gemm import use_lane
+
+    return use_lane(lane)
 
 
 class SharedExpertsOrder(IntEnum):
@@ -135,7 +151,7 @@ class SharedExperts(torch.nn.Module):
         idx = self._output_idx
         assert self._output[idx] is None
         self._input_ready_event[idx].record(current_stream())
-        with torch.cuda.stream(self._stream):
+        with torch.cuda.stream(self._stream), _thin_gemm_lane(1):
             self._input_ready_event[idx].wait(self._stream)
             self._output[idx] = self._layer(shared_experts_input)
             self._output_ready_event[idx].record(self._stream)

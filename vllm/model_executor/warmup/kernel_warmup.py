@@ -248,6 +248,15 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     b12x_warmup(worker, cudagraph_capture_sizes)
 
+    # The sm_80 thin-M BF16 GEMM (vllm/sm80/kernels/thin_gemm/). MUST run before
+    # capture_model(): thin_gemm keeps its FP32 split-K partials and arrival
+    # counters in an allocate-once module-level cache, and a first launch cannot
+    # happen inside a capture at all. Zero import cost with the switch unset.
+    if envs.VLLM_THIN_GEMM:
+        from vllm.sm80.kernels.thin_gemm.warmup import warmup_ampere_thin_gemm
+
+        warmup_ampere_thin_gemm(worker, cudagraph_capture_sizes)
+
     minimax_m3_msa_warmup(worker)
 
     # Allocate the exact decode-sized workspace, autotune cache misses, and

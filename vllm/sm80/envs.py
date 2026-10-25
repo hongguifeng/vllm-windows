@@ -82,6 +82,14 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_EXL3_PLE_HOSTFN_READ": lambda: bool(
         int(os.getenv("VLLM_EXL3_PLE_HOSTFN_READ", "0"))
     ),
+    # sm_80 thin-M BF16 GEMM (vllm/sm80/kernels/thin_gemm/) for the layers an
+    # AutoRound 2-bit block leaves in BF16: hyper-connection mix/inject, router,
+    # shared expert, GDN in_proj_a/b, PLE and lm_head.
+    "VLLM_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_THIN_GEMM", "0"))),
+    # Largest row count dispatched to thin_gemm; above it cuBLAS wins on this part.
+    "VLLM_THIN_GEMM_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_THIN_GEMM_MAX_TOKENS", "32")
+    ),
 }
 
 
