@@ -266,6 +266,7 @@ class CompletionRequest(OpenAIBaseModel):
         return TokenizeParams(
             max_total_tokens=model_config.max_model_len,
             max_output_tokens=self.max_tokens or 0,
+            reserve_output_tokens=False,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             truncation_side=self.truncation_side,
             add_special_tokens=self.add_special_tokens,
