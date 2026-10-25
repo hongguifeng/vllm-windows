@@ -1,5 +1,11 @@
 # Fork survey: `Morrowmake/vllm-cmp170hx` — what is worth importing
 
+> **已被取代（2026-10-22）。** 自这次扫描以来 fork 前进了约 2.5 周：它现在自己也跑
+> Qwen3.8-Flash-Next，代码整体迁进了 `vllm/sm80/`，下面列出的若干 opt-in 在上游又被删掉了。
+> 当前可落地清单请看
+> [FORK_CMP170HX_SURVEY_V2_2026-10-22.md](FORK_CMP170HX_SURVEY_V2_2026-10-22.md)；本文件保留为
+> 2026-10-05 的记录。下面引用的 hash 如今大多已悬空（fork 会不断 rebase 到更新的上游）。
+
 Surveyed 2026-10-05. The extracted patches live in `_dev/fork_cmp170hx/patches/`.
 Neither they nor the commit dump is committed (both are generated); rebuild the
 dump with:
