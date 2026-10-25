@@ -102,6 +102,27 @@ param(
     [int]$MaxImages = 0,
     [switch]$NoAllocHeal,
     [switch]$Graphs,
+    # sm_80 thin-M BF16 GEMM for the layers the 2-bit block leaves in BF16
+    # (vllm/sm80/kernels/thin_gemm/): hyper-connection mix/inject, router,
+    # shared expert, GDN in_proj_a/b, PLE, lm_head. ON by default since
+    # 2026-10-22: production is C=1 single-stream, where it measured -4% ITL
+    # (_dev/docs/FORK_CMP170HX_SURVEY_V2_2026-10-22.md §8.3). Kill switch:
+    # -NoThinGemm, and VLLM_THIN_GEMM is forced either way so a value inherited
+    # from the shell cannot change what this launcher serves.
+    [switch]$NoThinGemm,
+    # Keep the fla autotuner from benchmarking configs whose sm_80 build spills
+    # more than 1 KiB of local memory per thread: the driver keeps the context's
+    # local size at the largest one launched, which costs KV cache for the life
+    # of the process (fork measured ~1.5 GiB on a 74-SM card). On by default;
+    # -NoFlaSkipSpilling forces it off.
+    [switch]$NoFlaSkipSpilling,
+    # Log the KV cache plan (per-group spec, page size, blocks charged per
+    # request, speculative scratch, resulting concurrency). Diagnostic only:
+    # the numbers are the ones the engine used, one line at startup.
+    [switch]$KvPlanLog,
+    # Largest row count the thin GEMM takes. 8, not the fork's 32: on this model
+    # M=16 (C=4 with k=3) loses ~8% in-graph while M=4 wins ~4%.
+    [int]$ThinGemmMaxTokens = 8,
     # Empty (default) lets vLLM derive capture sizes itself. Pass a bracketed
     # list to reproduce the WSL arm's explicit capture coverage, e.g.
     #   -CaptureSizes '[1,2,3,...,2048]'
@@ -252,6 +273,25 @@ if ($FusedAlign) {
 if ($PreparedLaunch) {
     $env:VLLM_TRITON_PREPARED_LAUNCH = '1'
 }
+# Forced both ways: -NoThinGemm is the only way out, so a shell that exported
+# VLLM_THIN_GEMM=0 (or 1 with another bound) cannot silently change what this
+# launcher serves.
+$env:VLLM_THIN_GEMM = if ($NoThinGemm) { '0' } else { '1' }
+if (-not $NoThinGemm) {
+    $env:VLLM_THIN_GEMM_MAX_TOKENS = "$ThinGemmMaxTokens"
+    # Default ON is only safe when the tree being served actually carries the
+    # kernel: the checkout's own .venv is a 2026-09-26 install without vllm/sm80,
+    # and importing it from there would fail at model build.
+    if (-not (Test-Path -LiteralPath "$Venv\.venv\Lib\site-packages\vllm\sm80\kernels\thin_gemm\__init__.py")) {
+        Write-Host "ERROR: thin GEMM is on but $Venv\.venv has no vllm/sm80/kernels/thin_gemm." -ForegroundColor Red
+        Write-Host "       Serve the deployed tree (-Venv $REPO\.flashnext-root) or pass -NoThinGemm." -ForegroundColor Red
+        exit 1
+    }
+}
+# Forced both ways like the thin-GEMM switch: only -NoFlaSkipSpilling turns it
+# off, an inherited value cannot change what this launcher serves.
+$env:VLLM_FLA_AUTOTUNE_SKIP_SPILLING = if ($NoFlaSkipSpilling) { '0' } else { '1' }
+$env:VLLM_KV_PLAN_LOG = if ($KvPlanLog) { '1' } else { '0' }
 if ($PleTrace) {
     $env:VLLM_PLE_SSD_TRACE = '1'
 }
@@ -520,7 +560,9 @@ Write-Host ("limits : $MaxLen ctx, $MaxSeqs seqs, $BatchedTokens batched tokens,
     $(if ($specMethod -eq 'mtp' -and $AdaptiveK -gt 0) { ", adaptive k<=$AdaptiveK" } elseif ($specMethod -eq 'dflash') { ", fixed k=$DflashDrafts" } else { ', fixed k' }) +
             $(if ($KvGiB -gt 0) { ", KV $KvGiB GiB fixed" } else { '' }) +
             $(if ($LoadStrategy) { ", load $LoadStrategy" } else { '' }) +
-            $(if ($NoAllocHeal) { ', alloc-heal OFF' } else { ", alloc-heal free<$($env:QSA_ALLOC_HEAL_FREE_MB)MiB cached>$($env:QSA_ALLOC_HEAL_CACHED_MB)MiB" }))
+            $(if ($NoAllocHeal) { ', alloc-heal OFF' } else { ", alloc-heal free<$($env:QSA_ALLOC_HEAL_FREE_MB)MiB cached>$($env:QSA_ALLOC_HEAL_CACHED_MB)MiB" }) +
+            $(if ($NoThinGemm) { ', thin-GEMM off' } else { ", thin-GEMM on (M<=$ThinGemmMaxTokens)" }) +
+            $(if ($NoFlaSkipSpilling) { ', fla skip-spilling off' } else { ', fla skip-spilling on' }))
 Write-Host ("log    : $log")
 Write-Host ''
 
