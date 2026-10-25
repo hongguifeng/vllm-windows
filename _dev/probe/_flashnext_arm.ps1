@@ -12,7 +12,9 @@
 param(
     [string]$Model = 'D:\models\Qwen3.8-Flash-Next-AutoRound-3bpw-MTP',
     [string]$Drafter = 'D:\models\Qwen3.8-Flash-Next-DFlash2',
-    [string]$ServedName = 'Qwen3.8-Flash-Next-Arm',
+    # Same id as the production service, so a client can point at either
+    # endpoint without rewriting model names; the port is what tells them apart.
+    [string]$ServedName = 'Qwen3.8-Flash-Next',
     [int]$Port = 9402,
     [int]$Gpu = 2,
     [ValidateSet('dflash', 'mtp', 'none')]
@@ -25,6 +27,10 @@ param(
     [double]$MemUtil = 0.96,
     [int]$BlockSize = 0,
     [int]$PrefixMatchUnit = 0,
+    [string]$KvDtype = '',
+    # Raises the model's declared context limit so --max-model-len can exceed it,
+    # e.g. '{"max_position_embeddings":450000}'.
+    [string]$HfOverrides = '',
     [int]$LongPrefillThreshold = -1,
     [string]$IndexerKvDtype = '',
     [int]$KvOffloadGb = 0,
@@ -87,6 +93,8 @@ $argv = @(
 )
 if ($BlockSize -gt 0) { $argv += @('--block-size', "$BlockSize") }
 if ($PrefixMatchUnit -gt 0) { $argv += @('--prefix-match-unit', "$PrefixMatchUnit") }
+if ($KvDtype) { $argv += @('--kv-cache-dtype', $KvDtype) }
+if ($HfOverrides) { $argv += @('--hf-overrides', (EscJson $HfOverrides)) }
 if ($LongPrefillThreshold -ge 0) {
     $argv += @('--long-prefill-token-threshold', "$LongPrefillThreshold")
 }
@@ -134,5 +142,7 @@ if ($DryRun) { exit 0 }
 
 $p = Start-Process -FilePath $py -ArgumentList $argv -PassThru -NoNewWindow `
     -RedirectStandardOutput $out -RedirectStandardError $err
-"$($p.Id) $out" | Set-Content -Path "$repo\_dev\out\arms\last"
+# pid, port and log: the served name is no longer unique, so the stop script
+# identifies this instance by its port instead.
+"pid=$($p.Id) port=$Port log=$out" | Set-Content -Path "$repo\_dev\out\arms\last"
 Write-Host "pid $($p.Id)"
