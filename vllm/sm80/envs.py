@@ -90,6 +90,13 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_THIN_GEMM_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_THIN_GEMM_MAX_TOKENS", "32")
     ),
+    # Keep the fla autotuner from benchmarking (and thus reserving) configs
+    # whose sm_80 build spills more than 1 KiB of local memory per thread:
+    # the driver grows the context's local size to the largest one launched and
+    # never shrinks it, which costs KV cache for the life of the process.
+    "VLLM_FLA_AUTOTUNE_SKIP_SPILLING": lambda: bool(
+        int(os.getenv("VLLM_FLA_AUTOTUNE_SKIP_SPILLING", "0"))
+    ),
 }
 
 
