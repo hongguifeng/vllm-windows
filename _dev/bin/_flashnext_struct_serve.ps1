@@ -51,6 +51,10 @@ param(
     # 0 leaves each at the engine's own choice.
     [int]$BlockSize = 0,
     [int]$PrefixMatchUnit = 0,
+    # KV cache dtype. Empty keeps the engine default (bf16, ~30.7 KiB/token).
+    # "fp8" halves it, which is what makes a 500k-token pool fit on one 170HX;
+    # the cost is ~8-10% decode throughput and slightly different logits.
+    [string]$KvDtype = '',
     # Fair chunked prefill (both default 0 = upstream scheduling). A positive
     # -PrefillChunkWithDecodes caps the prefill tokens issued per step whenever
     # something is decoding, which is what keeps co-resident decode latency down
@@ -393,6 +397,9 @@ if ($KvOffloadGb -gt 0) {
 }
 if ($PrefixMatchUnit -gt 0) {
     $argv += @('--prefix-match-unit', "$PrefixMatchUnit")
+}
+if ($KvDtype) {
+    $argv += @('--kv-cache-dtype', $KvDtype)
 }
 if ($IterDetails) {
     $argv += @('--enable-logging-iteration-details')
