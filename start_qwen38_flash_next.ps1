@@ -64,13 +64,14 @@ param(
     [int]$PleWorkers = 16,
     [int]$PlePrefetchTokens = 16384,
     [int]$MtpTokens = 3,
-    # Speculation method. 'auto' (default) keeps production on its native MTP
-    # head; 'dflash' serves inco.ai's DFlash 2 drafter instead, which drafts
-    # -DflashDrafts tokens in one pass and ignores -MtpTokens/-AdaptiveK.
-    # Measured on one 170HX: DFlash wins only for single-user code, MTP wins on
-    # Chinese prose and at 2+ users (_dev/docs/FLASHNEXT_SINGLE_CARD_ACCEL_2026-10-21.md).
+    # Speculation method. 'dflash' (default) serves inco.ai's DFlash 2 drafter,
+    # which drafts -DflashDrafts tokens in one pass; 'mtp' uses the checkpoint's
+    # own head, 'none' turns speculation off. Measured on one 170HX: DFlash wins
+    # for single-user code and loses on Chinese prose and at 2+ users
+    # (_dev/docs/FLASHNEXT_SINGLE_CARD_ACCEL_2026-10-21.md); pass -Spec mtp to go
+    # back to the native head.
     [ValidateSet('auto', 'mtp', 'dflash', 'none')]
-    [string]$Spec = 'auto',
+    [string]$Spec = 'dflash',
     [string]$Drafter = 'D:\models\Qwen3.8-Flash-Next-DFlash2',
     [int]$DflashDrafts = 7,
     # Acceptance-adaptive draft count. Default -1 means "follow -MtpTokens",
