@@ -157,10 +157,11 @@ extension 256 class True
   `wsl -d Ubuntu -- bash -lc 'cd ~/qwen38-recipe && bash start.sh'`（先停 Windows 侧）。
 
 ### 能力对照（SWE-bench Verified）
-EXL3（WSL recipe）与记录里两臂 AutoRound 3bpw 的同协议对照、cap 4096 对照与轨迹级失败分析，
-见 [`agent_bench/RESULTS_flash_next_exl3_vs_autoround.md`](../../agent_bench/RESULTS_flash_next_exl3_vs_autoround.md)：
-HARD-26 12/26 vs 16/26（p=0.34）、S-40 19/40 vs 22/40（p=0.45）、合并 31/66 vs 38/66（p=0.14），
-差距主要来自 1536 思考溢出与"多文件修复只做一半"。
+EXL3 5.05bpw、AutoRound 3bpw、推理预算（cap × step limit × effort）与 DeepSeek 参照的
+完整对照见 [`agent_bench/RESULTS_qwen38_flash_next_swebench.md`](../../agent_bench/RESULTS_qwen38_flash_next_swebench.md)：
+同协议 1536/60 下 EXL3 31/66 vs AutoRound 38/66（p=0.14）；同样的 xhigh 30000/200 下
+**EXL3 64/66 vs AutoRound 61/66**（discordant 4/1，p=0.38）。早期所有 47–61% 的低分
+主要是预算假象，不是量化或模型能力。
 
 ### 端到端过程中修掉的 Windows/版本适配问题
 1. `WeightsMapper.map_name` → Windows 只有 `_map_name`（`quant.py`）。
