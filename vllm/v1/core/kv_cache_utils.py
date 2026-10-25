@@ -1105,6 +1105,7 @@ def get_max_concurrency_for_kv_cache_config(
     host_blocks_per_request = 0
     scratch_blocks_per_request = 0
     host_scratch_blocks_per_request = 0
+    plan: list[str] = []
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
         required = cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
@@ -1114,6 +1115,18 @@ def get_max_concurrency_for_kv_cache_config(
         # The scratch is a subset of the per-request footprint; never let a
         # spec claim more scratch than it claims memory.
         scratch = min(scratch, required)
+        if envs.VLLM_KV_PLAN_LOG:
+            per_layer = spec
+            if isinstance(per_layer, UniformTypeKVCacheSpecs):
+                per_layer = per_layer.first_spec
+            plan.append(
+                f"[{len(plan)}] {type(per_layer).__name__} "
+                f"layers={len(group.layer_names)} "
+                f"block={spec.block_size} page={spec.page_size_bytes} "
+                f"charged={required} scratch={scratch}"
+                + (" eagle" if group.is_eagle_group else "")
+                + (" host" if group.host_resident else "")
+            )
         if group.host_resident:
             host_blocks_per_request += required
             host_scratch_blocks_per_request += scratch
@@ -1143,7 +1156,19 @@ def get_max_concurrency_for_kv_cache_config(
                 max_num_seqs,
             )
         )
-    return min(limits)
+    concurrency = min(limits)
+    if envs.VLLM_KV_PLAN_LOG:
+        logger.info_once(
+            "KV cache plan (VLLM_KV_PLAN_LOG): num_blocks=%d, %d blocks per "
+            "request of which %d scratch, max_num_seqs=%d, concurrency %.4f; %s",
+            kv_cache_config.num_blocks,
+            num_blocks_per_request,
+            scratch_blocks_per_request,
+            max_num_seqs,
+            concurrency,
+            "; ".join(plan),
+        )
+    return concurrency
 
 
 def _log_mamba_inflight_states(

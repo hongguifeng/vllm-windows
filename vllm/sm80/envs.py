@@ -97,6 +97,10 @@ FORK_ENV_VARS: dict[str, Callable[[], Any]] = {
     "VLLM_FLA_AUTOTUNE_SKIP_SPILLING": lambda: bool(
         int(os.getenv("VLLM_FLA_AUTOTUNE_SKIP_SPILLING", "0"))
     ),
+    # Log the KV cache plan: per-group spec type, block and page bytes, blocks
+    # charged per request and the speculative scratch, plus the resulting
+    # concurrency. Diagnostic only; the numbers are the ones the engine used.
+    "VLLM_KV_PLAN_LOG": lambda: bool(int(os.getenv("VLLM_KV_PLAN_LOG", "0"))),
 }
 
 
