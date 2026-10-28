@@ -431,6 +431,12 @@ if (-not $NoPatches -and -not $DryRun) {
     # Runtime behaviour is gated on VLLM_OFFLOAD_RELEASE_AFTER_FORWARD, so the
     # patch itself is inert until the env var below is set (it is, by default).
     Invoke-Logged $py -Arguments @("$PATCHES\fix_offload_release.py", $SITEVLLM, "$REPO\vllm"); $rcs += $script:LastRc
+    # Upstream HyperQwen ports, re-cut onto 0.29.1 and idempotent like the fix_*
+    # scripts above. A tree that does not carry the code they hang on reports SKIP.
+    Invoke-Logged $py -Arguments @("$PATCHES\fix_pinned_kv_empty_cache.py", $SITEVLLM, "$REPO\vllm"); $rcs += $script:LastRc
+    Invoke-Logged $py -Arguments @("$PATCHES\fix_gdn_accepted_bound.py", $SITEVLLM, "$REPO\vllm"); $rcs += $script:LastRc
+    Invoke-Logged $py -Arguments @("$PATCHES\fix_bench_sse_keepalive.py", $SITEVLLM, "$REPO\vllm"); $rcs += $script:LastRc
+    Invoke-Logged $py -Arguments @("$PATCHES\fix_compile_key_knobs.py", $SITEVLLM, "$REPO\vllm"); $rcs += $script:LastRc
     $bad = $rcs | Where-Object { $_ -ne 0 }
     if ($bad) { Write-Host "WARNING: a patch step returned $($bad -join ', ')" -ForegroundColor Yellow }
 }
