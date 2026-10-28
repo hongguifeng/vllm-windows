@@ -49,6 +49,17 @@ STRIP_RE = re.compile(
 
 
 def _replacement(indent: str) -> str:
+    if len(indent) > 20:
+        # The audio request function nests one level deeper, where this
+        # wording overruns the 88-column limit, so a shorter restatement
+        # of the same point.
+        return (
+            f"{indent}# [fix_bench_sse_keepalive] the SSE separators are data:\n"
+            f"{indent}# stripping a network chunk deletes the blank line\n"
+            f"{indent}# between messages, so a keep-alive comment glues onto\n"
+            f"{indent}# every later message.\n"
+            f"{indent}if not chunk_bytes.strip():\n"
+        )
     return (
         f"{indent}# [fix_bench_sse_keepalive] the SSE separators are data: stripping"
         f" a\n"

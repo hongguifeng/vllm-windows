@@ -557,6 +557,15 @@ class Worker(WorkerBase):
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
+            # [fix_pinned_kv_empty_cache] The pool is allocated right after this
+            # return, on top of whatever the profile run left cached. On a cold
+            # compile cache that is torch.compile + Triton autotune scratch
+            # (1.2 GiB on a 24 GiB card), which the pinned size does not budget
+            # for: the card ends up over-committed, and the overflow is not an
+            # error -- it is served from host memory at PCIe speed. Hand it back
+            # before the pool is reserved, like the measured path does.
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
