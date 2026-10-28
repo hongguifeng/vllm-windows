@@ -12,6 +12,8 @@
 | **SWE-Bench Pro V2** | 20 题（A/B 各 10） | **20/20（100%）** | **17/20（85%）** | **18/20（90%）** |
 | **DeepSWE** | 10 题（seed 0） | **7/10（70%）** | — | **4/10（40%）** |
 
+> **2026-10-26 追加**：本机自持的 **Maya-M**（GLM-5.3-Flash 2-bit 量化，2×CMP 170HX）在**同一套 DeepSWE 10 题**上跑到 **3/10**，但目标测试 **721/790（91.3%）**通过，且**没有一题因 262k 上下文超限**。详见 §9。
+
 - Pro V2 对 DeepSeek 已接近天花板（20/20，42 分钟）；AutoRound 18/20，EXL3 17/20，
   其中 EXL3 有 1 题是评测侧补丁捕获 bug 导致的假失败（`openlibrary-03095f`，详见 §3.1），
   修正后两者基本持平。
@@ -280,3 +282,134 @@ pier run -p tasks -e docker -a mini-swe-agent -m openai/deepseek-flash \
 - EXL3 的 Pro V2 一轮曾被误杀（清理容器时删了模型服务），已补跑；前 14 题中 3 题因中断
   重跑过，不影响已记录结果；其中 `openlibrary-03095f` 的 0 字节补丁是评测侧捕获 bug，
   用 commit-aware 捕获重跑后 EXL3 应为 18/20。
+
+## 9. 追加：Maya-M（GLM-5.3-Flash 2-bit，本机 2×CMP 170HX）DeepSWE 10 题（2026-10-26）
+
+> 新臂：**Project Maya v1.1.27 + Maya-M**（自持 GGUF 量化，IQ2_S/IQ3_XXS，116 GB），
+> 两张 CMP 170HX 64G 各占一半层、`--max-context 262144`、`--parallel 1`。
+> 走本地 LLM 代理 `http://127.0.0.1:12346/v1`（OpenAI 兼容，`/v1/models` 报 `glm-5.3-flash`、`n_ctx 262144`）。
+> 与前面几轮**同题集（seed 0 的 10 题）、同 harness（Harbor + host 侧 mini-swe-agent）、同协议**
+> （温度 0、`max_tokens=30000`、`reasoning_effort=high`、`step_limit=200`）。
+> 唯一差异：为了稳定，本臂用**单并发**（每请求 55–70 tok/s），总耗时 **5 h 11 min**（≈43 min/题）。
+
+### 9.1 配置
+
+| 项 | 值 |
+|---|---|
+| 模型 | Maya-M（GLM-5.3-Flash，2-bit 量化），OpenAI 兼容端点 |
+| agent | `deep_host_agent:CommitHostMiniSwe`（宿主机侧跑 LLM 循环；结束时 `git add -A && git commit`，供 collect 钩子 `git diff base HEAD` 取补丁） |
+| agent 配置 | `v2/tooling/configs/host_maya_12346.yaml`：`api_base=http://127.0.0.1:12346/v1`、`timeout=3600`、去掉 Qwen 专属 `chat_template_kwargs` |
+| 协议 | 温度 0、`max_tokens=30000`、`reasoning_effort=high`、`step_limit=200` |
+| 并发 | `n_concurrent_trials=1`（`--parallel 1`） |
+| 超时 | 请求 3600 s；`--agent-timeout-multiplier 2`、`--verifier-timeout-multiplier 2` |
+| 结果 | **3/10（30%）**；f2p **721/790 = 91.3%**；0 errored / 0 上下文超限 |
+
+### 9.2 结果（10 题，job `maya-deepswe7`）
+
+| # | 任务 | reward | f2p | p2p | 工具调用 | 失败形态 |
+|---|---|---:|---:|---:|---:|---|
+| 1 | arcane-drift-detection-baselines | **1** | 82/82 | 2/2 | 128 | — |
+| 2 | bandit-structured-nosec-directives | 0 | 68/69 | 281/282 | 115 | 近失 + 回归 |
+| 3 | effect-sse-httpapi-streaming | 0 | 42/47 | 70/70 | 200 | 部分实现 |
+| 4 | go-critic-doc-link-checker | 0 | 2/3 | 15/16 | 93 | 近失 + 回归 |
+| 5 | koota-entity-snapshot-rollback | 0 | 83/84 | 47/47 | 90 | 近失 |
+| 6 | kysely-window-grouping-helpers | 0 | 250/254 | 22/22 | 111 | 近失 |
+| 7 | langchain-request-coalescing | **1** | 50/50 | 232/232 | 104 | — |
+| 8 | meriyah-explicit-resource-declarations | 0 | 48/49 | 51 469/51 469 | 126 | 近失 |
+| 9 | true-myth-iterable-collection-combinators | **1** | 96/96 | 561/561 | 70 | — |
+| 10 | vitest-duration-sharding | 0 | **0/56** | 0/24 | 111 | **构建被改坏** |
+
+### 9.3 三个臂的对照（同题集）
+
+| 臂 | 分数 | 是否撞 262k 上下文墙 | 备注 |
+|---|---:|---|---|
+| DeepSeek flash（API） | **7/10** | 否 | 参考上限 |
+| AutoRound 3bpw（Qwen3.8-Flash-Next） | **4/10** | 是（effect、meriyah） | 转 2 并发后加深了上下文压力 |
+| **Maya-M 2-bit（本机 2×CMP 170HX）** | **3/10** | **否** | 单并发 55–70 tok/s；91.3% 目标测试通过 |
+
+### 9.4 失败解剖：不是"不会写"，是"差最后一口"
+
+- **5 题近失**（1–4 个边界用例）：koota 83/84、kysely 250/254、meriyah 48/49、bandit 68/69、go-critic 2/3。
+  DeepSWE 的规则是 f2p 与 p2p 全过才记 1，所以 0.99 的分也记 0。
+- **2 题带回归**：bandit 挂 `test_058_region_unioned_across_statement_lines`（f2p 还差 1 个）、
+  go-critic 挂 1 个 p2p。**改功能时碰坏既有行为**，是小比特量化模型最典型的一种退化。
+- **1 题部分实现**：effect-sse 42/47。对照 DeepSeek 是 **0/47**（完全没做），Maya 反而做得更多。
+- **1 题构建被改坏**：vitest 的补丁 73,317 B，但 `src/node/duration-history.ts` 有 `TS9010`
+  类型错误 → `pnpm build`（rollup + unplugin-isolated-decl）失败、`dist/cli.js` 不存在、
+  测试根本没跑起来。**`f2p 0/56` 且 `p2p 0/24` 就是这个信号**（不是"实现错"，是"没编译过"）。
+- **反面证据**：meriyah 的 **51,469 个 p2p 全过**、kysely 250/254、bandit 281/282 ——
+  说明它**没有乱改**，只是少做一点。
+
+### 9.5 本轮新踩的坑（与 §5 合并参考）
+
+| 坑 | 现象 | 修法 |
+|---|---|---|
+| litellm 默认 600 s 请求超时 | Maya 侧 `glm multi: request N done (cancel): 9343 tokens in 588.5 s`；agent 卡在重试退避里 **24 分钟不前进**（轨迹 mtime 冻结、Maya 里只剩 2–3 running） | `model_kwargs.timeout=3600`（`host_maya_12346.yaml`） |
+| Docker 地址池耗尽 | 启动后 10 题在 **11 秒内全部** `RuntimeError`：`all predefined address pools have been fully subnetted` | `docker network prune -f`（历史 run 的 compose network 残留了 30 个，清到 3 个） |
+| harbor 的 uv 工具环境缺依赖 | `No module named 'host_mini_swe'` / `'minisweagent'` / `'mcp'` | `PYTHONPATH=v2/tooling`；`uv pip install --python ~/.local/share/uv/tools/harbor/bin/python mini-swe-agent==2.4.6 mcp` |
+| 宿主侧 `agent/model.patch` 恒为 0 B | 看着像"抓补丁失败" | 正常：`CommitHostMiniSwe` 先 commit，`git diff --cached` 自然为空；**真正的补丁在 `artifacts/logs/artifacts/model.patch`** |
+| 并发与长生成的冲突 | 4 并发下每请求仅 13–15 tok/s，9 K token 的步骤要 10 min，必撞 600 s 超时 | 评测改**单并发**（55–70 tok/s），代价是总量 5 h |
+
+### 9.6 Caveats
+
+- **单次运行、10 题**：3/10 的 95% 置信区间约 **7%–65%**，与 4/10、7/10 都不可分；
+  也没有做同题配对（McNemar）检验。
+- 本臂是 **2-bit 量化**（Maya-M，IQ2_S/IQ3_XXS），与 DeepSeek API、AutoRound 3bpw 不是严格同条件比较。
+- 单并发是**评测选择**，不是模型限制；换 `--parallel 2` 能把 10 题压到约 2.5–3 h，但长生成会接近 600 s 线（已用 3600 s 超时规避）。
+- `go-critic` 只有 3 个 f2p 测试，单点失败会被放大；若只看 f2p 通过率，应把这题按"3 个样本"加权。
+
+### 9.7 与 3bpw 臂（AutoRound / Qwen3.8-Flash-Next）逐题对照
+
+两臂**同题集、同 harness 家族、同协议**（温度 0、`max_tokens=30000`、`step_limit=200`），差异只有两处：
+3bpw 臂是 `xhigh` + **每卡 2 并发**；本臂是 `high` + **单并发**。下表两列都取自各自 job 目录里的
+`verifier/reward.json`（3bpw 的数据从 `jobs/dswe-ar-*/` 重新抽取，与 §3.2.1 一致）。
+
+| 任务 | 3bpw reward | 3bpw f2p | 3bpw p2p | Maya reward | Maya f2p | Maya p2p | 差异 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| arcane-drift-detection-baselines | **1** | 82/82 | 2/2 | **1** | 82/82 | 2/2 | 平 |
+| true-myth-iterable-collection-combinators | **1** | 96/96 | 561/561 | **1** | 96/96 | 561/561 | 平 |
+| langchain-request-coalescing | 0 | 49/50 | 232/232 | **1** | **50/50** | 232/232 | **Maya 多 1 个测试 → 过** |
+| bandit-structured-nosec-directives | 0 | **69/69** | 281/282 | 0 | 68/69 | 281/282 | 都因**回归**挂；AR 目标全过 |
+| koota-entity-snapshot-rollback | 0 | 80/84 | 47/47 | 0 | **83/84** | 47/47 | 都近失；Maya 少差 3 个 |
+| kysely-window-grouping-helpers | 0 | **0/254** | 22/22 | 0 | **250/254** | 22/22 | **同分，但实现量差 250 个测试** |
+| go-critic-doc-link-checker | **1** | 3/3 | 16/16 | 0 | 2/3 | 15/16 | AR 过；Maya 近失 + 回归 |
+| vitest-duration-sharding | **1** | 56/56 | 24/24 | 0 | **0/56** | 0/24 | AR 过；Maya **构建被改坏**（TS9010） |
+| effect-sse-httpapi-streaming | — | — | — | 0 | 42/47 | 70/70 | AR **无结果**（262k 超限）；Maya 有分 |
+| meriyah-explicit-resource-declarations | — | — | — | 0 | 48/49 | 51 469/51 469 | AR **无结果**（262k 超限 + artifact collision）；Maya 有分 |
+
+**① 分数：4/10 vs 3/10，统计上不可分。**
+两臂都出结果的 8 题里，Maya 独赢 1 题（langchain）、3bpw 独赢 2 题（go-critic、vitest），
+同过 2 题、同挂 3 题。配对 McNemar 的不一致对是 **b=1 / c=2**，精确双侧 **p = 1.0** ——
+10 题的样本量下，这个 1 题之差就是噪声。3bpw 多的那 1 分，还正好来自 **2 题上下文超限** 的免除。
+
+**② 实现广度：Maya 明显更高，但被两件事抵消。**
+8 道共同题的 f2p 合计：**3bpw 435/694（62.7%）** vs **Maya 631/694（90.9%）**。
+差距几乎全部来自 `kysely`：3bpw 是 **0/254**（完全没实现），Maya 是 **250/254**。
+同时 Maya 在 `koota`（+3）、`langchain`（+1，且因此从 0 变成 1）上也更好；
+只在小样本题上更差（`go-critic` −1、`bandit` −1）。
+
+**③ 反向的例外：`vitest` 是 Maya 唯一"整题归零"的失败。**
+3bpw 56/56 全过，Maya 的补丁 73 KB 但有 `TS9010` 类型错误 → `pnpm build` 失败 → `f2p 0/56` 且 `p2p 0/24`。
+**这不是"实现得少"，是"没验证自己的改动能编译"**，也是两臂最本质的差别：
+3bpw 臂在这个任务上跑通了构建，Maya 没有。
+
+**④ 上下文：Maya 更省。**
+同样的 256 K 上限、同样的 30 K 输出预算，3bpw 在 `effect-sse`/`meriyah` 上分别涨到
+`232,145+30,000` 和 `246,145+16,000` 撞墙；Maya 这两题的 prompt 峰值只到 **185 K / 140 K** 就收工
+（`step_limit=200` 先到），因此**两题都有分**。原因可能是 Maya 每步输出更短、或更早收敛，
+这一点值得用轨迹长度做单变量对照，本轮未做。
+
+**⑤ 一句话结论**：在这套 10 题上，**2-bit 的 Maya-M 与 3-bit 的 AutoRound 打平（3 vs 4，p=1.0）**；
+Maya 的**功能实现更完整**（f2p 90.9% vs 62.7%，主要靠 kysely），但**工程自检更弱**（vitest 编译都不过），
+且 3bpw 的 2 个失败是协议超限而非能力。要分出高下，需要 ① 把 262 K 墙去掉重跑 3bpw 那两题，
+② 对 5 道近失题做配对重跑（每臂 2–3 次）。
+
+### 9.8 产物
+
+| 内容 | 路径 |
+|---|---|
+| DeepSWE · Maya-M 10 题（本文件第 9 节） | `~/deep-swe/jobs/maya-deepswe7/` |
+| 题目录（每题含 `agent/`、`artifacts/`、`verifier/`） | `~/deep-swe/jobs/maya-deepswe7/instance_*` → 现为 `<task>__<suffix>/` |
+| job 配置 | `~/deep-swe/maya-deepswe7.json` |
+| agent 配置 | `~/SWE-bench_Pro-os/v2/tooling/configs/host_maya_12346.yaml` |
+| 早前 4 并发试跑（作废，供对照） | `~/deep-swe/jobs/maya-deepswe4/`、`maya-deepswe5/`（`maya-deepswe6` 为解析配置试跑） |
