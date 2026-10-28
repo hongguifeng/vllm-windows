@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Port the HyperQwen patch subset that pays off on a CMP 170HX into this tree.
 
 Source: WSL ``~/testcode/qwen38-27b-rtx3090`` (upstream ``syv-ai/HyperQwen``),
@@ -87,6 +90,8 @@ the sm89+ fp8 KV patch (sm_86 has no FP8 either), the vision-tower offload (0.29
 upstreamed it as --cpu-offload-gb/--cpu-offload-params, so no patch is needed),
 and the patches 0.29 already ships.
 
+    python port_wsl_patches.py --site            # repair the installed package
+    python port_wsl_patches.py --site --check    # report only, write nothing
 Usage::
 
     python port_wsl_patches.py            # apply to vllm/ and sync site-packages
@@ -100,15 +105,97 @@ it standalone always fails; that is expected, not a broken patch.
 """
 
 import argparse
+import contextlib
 import os
-import re
+import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
-REPO = os.path.dirname(os.path.abspath(__file__))
-PATCH_DIR = os.path.join(REPO, "_wslpatch")
-SITE_PACKAGES_VLLM = os.path.join(REPO, ".venv", "Lib", "site-packages", "vllm")
+import regex as re
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PATCH_DIR = os.path.join(REPO, "_dev", "patches", "wsl")
+# the installed package is located through the interpreter; see site_package_root()
+
+
+# --- target roots -------------------------------------------------------------
+# Everything here is found through the running interpreter or by looking for the
+# package's own fingerprint (envs.py plus v1/), never by spelling a directory: a
+# hardcoded venv or package name is exactly what went wrong before.
+
+
+def find_package(root):
+    """The vllm package directory inside root: has envs.py and v1/."""
+    for child in sorted(pathlib.Path(root).iterdir()):
+        if child.is_dir() and (child / "envs.py").is_file() and (child / "v1").is_dir():
+            return child
+    return None
+
+
+def site_package_root():
+    """The installed package, located through the interpreter that runs us."""
+    prefix = pathlib.Path(sys.prefix)
+    candidates = [prefix / "Lib" / "site-packages"]
+    for lib in sorted((prefix / "lib").glob("python*")):
+        candidates.append(lib / "site-packages")
+    for cand in candidates:
+        if not cand.is_dir():
+            continue
+        pkg = find_package(cand)
+        if pkg:
+            return str(pkg)
+    return None
+
+
+def repo_target():
+    """Patch the checked-out source tree; git apply needs --directory= there."""
+    pkg = find_package(REPO)
+    if pkg is None:
+        return None
+    return {"root": str(pkg), "cwd": REPO, "extra": [f"--directory={pkg.name}"]}
+
+
+def site_target():
+    """Patch the installed package in place: paths are already relative to it."""
+    root = site_package_root()
+    if root is None:
+        return None
+    return {"root": root, "cwd": root, "extra": []}
+
+
+# Derived (split / stripped / rebased) patch files go to a scratch directory,
+# never inside PATCH_DIR: written there they show up as untracked files in the
+# repo on every run.
+_TMP = None
+
+
+def tmp_path(name):
+    global _TMP
+    if _TMP is None:
+        _TMP = tempfile.mkdtemp(prefix="wslpatch-")
+    return os.path.join(_TMP, name)
+
+
+def drop_bytecode(root, rels):
+    """Remove stale .pyc for the modules we just rewrote."""
+    for rel in rels:
+        target = os.path.join(root, rel)
+        cache = os.path.join(os.path.dirname(target), "__pycache__")
+        if not os.path.isdir(cache):
+            continue
+        stem = os.path.basename(target).split(".")[0]
+        for fname in os.listdir(cache):
+            if fname.startswith(stem) and fname.endswith(".pyc"):
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(cache, fname))
+
+
+# Without these two the int8 W4A8 path yields garbage on an AutoRound checkpoint
+# (its group scales are about half negative, and the kernel reads them unsigned),
+# so a missing one has to stop the launch instead of only warning.
+HARD = ("marlin-int8-negative-scales", "marlin-int8-layer-select")
 
 # (basename, why it is carried) -- ordered exactly as patches/series has them.
 CARRIED = [
@@ -182,7 +269,7 @@ PREREQ = "qwen3_5-embed-quant"
 # left behind.
 ENVS_ANNOTATION_ANCHOR = '    VLLM_MARLIN_INT8_EXCLUDE_RE: str = "lm_head|mtp"\n'
 ENVS_ANNOTATION_INSERT = (
-    "    # syv patch (marlin-repack-staged-sm80): \"1\"/\"0\" override of the"
+    '    # syv patch (marlin-repack-staged-sm80): "1"/"0" override of the'
     " staging buffer, unset = on for sm80 only\n"
     "    VLLM_MARLIN_REPACK_STAGED: str | None = None\n"
 )
@@ -336,13 +423,13 @@ def rebased_partial(name):
     stripped = split_sections(
         patch_path,
         PARTIAL[name]["skip_files"],
-        out=os.path.join(PATCH_DIR, f"_{name}.stripped.patch"),
+        out=tmp_path(f"{name}.stripped.patch"),
     )[0]
     rebased = drop_hunk(
         stripped,
         spec["file"],
         spec["hunk"],
-        out=os.path.join(PATCH_DIR, f"_{name}.rebased.patch"),
+        out=tmp_path(f"{name}.rebased.patch"),
     )
 
     edits = list(PARTIAL[name]["manual_edits"])
@@ -373,7 +460,7 @@ def touched_paths(patch_path):
     with open(patch_path, encoding="utf-8", errors="replace") as handle:
         for line in handle:
             if line.startswith("+++ b/"):
-                rel = line[len("+++ b/"):].strip()
+                rel = line[len("+++ b/") :].strip()
                 if rel and rel != "/dev/null":
                     paths.append(rel)
     return paths
@@ -402,7 +489,7 @@ def split_sections(patch_path, skip_files, out=None):
         kept.append(section)
         kept_paths.append(name)
 
-    tmp = out or os.path.join(PATCH_DIR, "_partial.patch")
+    tmp = out or tmp_path("partial.patch")
     with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(header + "".join(kept))
     return tmp, kept_paths
@@ -423,7 +510,7 @@ def added_block(patch_path, target, hunk_index=0):
     with open(patch_path, encoding="utf-8", errors="replace") as handle:
         for line in handle:
             if line.startswith("+++ b/"):
-                current = line[len("+++ b/"):].strip()
+                current = line[len("+++ b/") :].strip()
                 index = -1
                 continue
             if line.startswith("diff --git "):
@@ -472,15 +559,15 @@ def drop_hunk(patch_path, target, hunk_index, out):
     return out
 
 
-def apply_manual_edits(edits, dry_run):
-    """Insert each (rel_path, anchor, insert) into vllm/<rel_path>.
+def apply_manual_edits(edits, target, dry_run):
+    """Insert each (rel_path, anchor, insert) into <target root>/<rel_path>.
 
     Idempotent: an anchor that is gone but whose insert is present counts as
     already done. Returns True when something changed.
     """
     changed = False
     for rel, anchor, insert in edits:
-        path = os.path.join(REPO, "vllm", rel)
+        path = os.path.join(target["root"], rel)
         with open(path, encoding="utf-8") as handle:
             content = handle.read()
         # "Is this insert already in the file?" must be answered with *all* its
@@ -489,8 +576,8 @@ def apply_manual_edits(edits, dry_run):
         # insert's banner (`# syv patch (<name>): ...`), so a single-line
         # substring test reports the registry knob as present right after the
         # annotation went in -- and silently skips it.
-        wanted = [ln.strip() for ln in insert.split("\n") if ln.strip()]
-        present = {ln.strip() for ln in content.split("\n")}
+        wanted = [ln.strip() for ln in insert.splitlines() if ln.strip()]
+        present = {ln.strip() for ln in content.splitlines()}
         if wanted and all(ln in present for ln in wanted):
             print(f"           already present: {rel}")
             continue
@@ -507,7 +594,7 @@ def apply_manual_edits(edits, dry_run):
     return changed
 
 
-def textually_applied(patch_path, skip_files=()):
+def textually_applied(patch_path, root, skip_files=()):
     """Fallback: every added line already present in its target file.
 
     Needed because a later patch can insert a line in the middle of an earlier
@@ -520,15 +607,16 @@ def textually_applied(patch_path, skip_files=()):
     with open(patch_path, encoding="utf-8", errors="replace") as handle:
         for line in handle:
             if line.startswith("+++ b/"):
-                current = line[len("+++ b/"):].strip()
+                current = line[len("+++ b/") :].strip()
                 continue
             if line.startswith("diff --git "):
                 current = None
                 continue
             if current is None or not line.startswith("+"):
                 continue
-            if any(current == skip or current.endswith("/" + skip)
-                   for skip in skip_files):
+            if any(
+                current == skip or current.endswith("/" + skip) for skip in skip_files
+            ):
                 continue
             body = line[1:].rstrip("\n")
             if body.strip():
@@ -537,26 +625,25 @@ def textually_applied(patch_path, skip_files=()):
     if not pending_by_file:
         return False
 
-    for rel, lines in pending_by_file.items():
-        path = os.path.join(REPO, "vllm", rel)
+    for rel, lines_to_find in pending_by_file.items():
+        path = os.path.join(root, rel)
         if not os.path.exists(path):
             return False
         with open(path, encoding="utf-8", errors="replace") as handle:
-            have = {cand.strip() for cand in handle.read().split("\n")}
-        if not all(ln.strip() in have for ln in lines):
+            have = {cand.strip() for cand in handle.read().splitlines()}
+        if not all(ln.strip() in have for ln in lines_to_find):
             return False
     return True
 
 
-def state(patch_path, skip_files=()):
-    """'applied', 'pending', or 'conflict'."""
-    if run(["git", "apply", "--check", "-R", "-p1", "--directory=vllm", patch_path],
-           check=False).returncode == 0:
+def state(patch_path, target, skip_files=()):
+    """'applied', 'pending', or 'conflict', against whichever tree we target."""
+    base = ["git", "apply", "--check", "-p1"] + target["extra"]
+    if run(base + ["-R", patch_path], cwd=target["cwd"], check=False).returncode == 0:
         return "applied"
-    if textually_applied(patch_path, skip_files):
+    if textually_applied(patch_path, target["root"], skip_files):
         return "applied"
-    if run(["git", "apply", "--check", "-p1", "--directory=vllm", patch_path],
-           check=False).returncode == 0:
+    if run(base + [patch_path], cwd=target["cwd"], check=False).returncode == 0:
         return "pending"
     return "conflict"
 
@@ -564,17 +651,34 @@ def state(patch_path, skip_files=()):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="dry run")
-    parser.add_argument("--repo-only", action="store_true",
-                        help="patch vllm/ but do not mirror into site-packages")
-    parser.add_argument("--batch", choices=["1", "2", "3", "all"], default="all",
-                        help="which batch to process; 'all' keeps series order")
+    parser.add_argument(
+        "--site",
+        action="store_true",
+        help="patch the installed package in place, instead of"
+        " the source tree; no mirroring step",
+    )
+    parser.add_argument(
+        "--repo-only",
+        action="store_true",
+        help="patch the source tree but do not mirror it",
+    )
+    parser.add_argument(
+        "--batch",
+        choices=["1", "2", "3", "all"],
+        default="all",
+        help="which batch to process; 'all' keeps series order",
+    )
     args = parser.parse_args()
 
-    prereq = os.path.join(PATCH_DIR, f"{PREREQ}.patch")
-    if os.path.exists(prereq):
-        print(f"prereq {PREREQ}: {state(prereq)}")
+    target = site_target() if args.site else repo_target()
+    if target is None:
+        print(f"cannot find the {'installed package' if args.site else 'source tree'}")
+        return 2
+    print(f"target: {target['root']}")
 
+    hard_missing = []
     synced_files = set()
+    changed_files = set()
     queue = {
         "1": CARRIED,
         "2": CARRIED_B,
@@ -582,77 +686,103 @@ def main():
         "all": CARRIED + CARRIED_B + CARRIED_C,
     }[args.batch]
 
+    prereq = os.path.join(PATCH_DIR, f"{PREREQ}.patch")
+    if os.path.exists(prereq):
+        print(f"prereq {PREREQ}: {state(prereq, target)}")
+
     for name, why in queue:
         patch_path = os.path.join(PATCH_DIR, f"{name}.patch")
         if not os.path.exists(patch_path):
             print(f"  MISSING  {name}")
+            if name in HARD:
+                hard_missing.append(f"{name}: no .patch in {PATCH_DIR}")
             continue
 
         partial = rebased_partial(name) or PARTIAL.get(name)
         if partial and "patch" in partial:
-            target = partial["patch"]
-            kept = touched_paths(target)
-            st = state(target)
-            applied = st == "applied"
-            print(f"  {'applied ' if applied else 'APPLYING'} {name}"
-                  f"  (rebased: {kept})")
+            target_patch = partial["patch"]
+            kept = touched_paths(target_patch)
+            st = state(target_patch, target)
         elif partial:
-            target, kept = split_sections(patch_path, partial["skip_files"])
-            st = state(target)
-            applied = st == "applied"
-            print(f"  {'applied ' if applied else 'APPLYING'} {name}  (partial: {kept})")
+            target_patch, kept = split_sections(patch_path, partial["skip_files"])
+            st = state(target_patch, target, partial["skip_files"])
         else:
-            target, kept = patch_path, touched_paths(patch_path)
-            st = state(patch_path)
-            applied = st == "applied"
-            print(f"  {'applied ' if applied else 'APPLYING'} {name}")
+            target_patch, kept = patch_path, touched_paths(patch_path)
+            st = state(patch_path, target)
+        applied = st == "applied"
+        print(f"  {'applied ' if applied else 'APPLYING'} {name}")
         print(f"           {why}")
 
         if st == "conflict" and not partial:
-            print("           CONFLICT -- a conflict here usually means a missing"
-                  " predecessor; the series applies in order")
+            print(
+                "           CONFLICT -- a conflict here usually means a missing"
+                " predecessor; the series applies in order"
+            )
+            if name in HARD:
+                hard_missing.append(f"{name}: conflict")
             continue
 
         if not applied:
             if st == "conflict" and partial:
-                # A conflict on the remaining hunks usually just means an
-                # earlier patch in the series has not landed yet (batch 2's
-                # hunks quote each other's lines). Applying is still the right
-                # move -- if the conflict is real, git apply raises and we stop
-                # instead of silently skipping the hunks.
                 print("           (conflict on remaining hunks; applying anyway)")
             if not args.check:
-                run(["git", "apply", "-p1", "--directory=vllm", target])
-            st = "pending"
+                run(
+                    ["git", "apply", "-p1"] + target["extra"] + [target_patch],
+                    cwd=target["cwd"],
+                )
+                st = state(
+                    target_patch, target, partial["skip_files"] if partial else ()
+                )
+                applied = st == "applied"
+                changed_files.update(kept)
 
         if partial:
-            apply_manual_edits(partial["manual_edits"], args.check)
-            # Files touched only by a manual insert (envs.py, and flash_attn.py
-            # for the rebased pair) are not in `kept` but do need mirroring.
+            if apply_manual_edits(partial["manual_edits"], target, args.check):
+                changed_files.update(
+                    rel for rel, _anchor, _ins in partial["manual_edits"]
+                )
             synced_files.update(rel for rel, _anchor, _ins in partial["manual_edits"])
 
         synced_files.update(kept)
+        if not applied and name in HARD:
+            hard_missing.append(f"{name}: {st}")
+
+    if _TMP:
+        shutil.rmtree(_TMP, ignore_errors=True)
+
+    if hard_missing:
+        print("\nHARD-MISSING -- the int8 W4A8 path gives garbage without these:")
+        for item in hard_missing:
+            print(f"  {item}")
+        return 3
 
     if args.check:
         print("\n(dry run -- nothing written)")
-        return
+        return 0
+
+    if args.site:
+        drop_bytecode(target["root"], changed_files)
+        print()
+        print(f"installed tree up to date; {len(changed_files)} file(s) rewritten")
+        return 0
 
     if not synced_files:
         print("\nno files to mirror")
-        return
+        return 0
 
     if args.repo_only:
         print(f"\nrepo only; {len(synced_files)} file(s) touched")
-        return
+        return 0
 
-    if not os.path.isdir(SITE_PACKAGES_VLLM):
-        print(f"\nno installed package at {SITE_PACKAGES_VLLM}; skipping mirror")
-        return
+    site_root = site_package_root()
+    if site_root is None:
+        print("\nno installed package found; skipping mirror")
+        return 0
 
-    print(f"\nmirroring into {SITE_PACKAGES_VLLM}")
+    print(f"\nmirroring into {site_root}")
     for rel in sorted(synced_files):
-        src = os.path.join(REPO, "vllm", rel)
-        dst = os.path.join(SITE_PACKAGES_VLLM, rel)
+        src = os.path.join(target["root"], rel)
+        dst = os.path.join(site_root, rel)
         if not os.path.exists(src):
             print(f"  skip (absent in tree): {rel}")
             continue
@@ -666,17 +796,16 @@ def main():
         print(f"  copied: {rel}")
 
     # Stale bytecode would shadow the edit on some import paths.
-    for root, _dirs, files in os.walk(SITE_PACKAGES_VLLM):
+    for root, _dirs, files in os.walk(site_root):
         if "__pycache__" not in root:
             continue
         for fname in files:
             if fname.endswith(".pyc"):
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(os.path.join(root, fname))
-                except OSError:
-                    pass
 
     print("\ndone")
+    return 0
 
 
 if __name__ == "__main__":

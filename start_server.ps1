@@ -50,9 +50,13 @@
 # What this pins down, and why each piece is load-bearing:
 #
 #   * python patches are applied first, idempotently:
-#       port_wsl_patches.py --batch 3   restores the "pad the drafter's 5
-#                                       sliding-window layers" bucketing that
-#                                       0.29 dropped. Without it 71,680 ctx
+#       port_wsl_patches.py --site --batch all repairs the installed package in
+#                                       place. Reinstalling the wheel wipes the
+#                                       carried patches and says nothing, so every
+#                                       boot puts them back. The batch-3 half
+#                                       restores the "pad the drafter's 5
+#                                       sliding-window layers" bucketing that 0.29
+#                                       dropped. Without it 71,680 ctx
 #                                       needs 6.37 GiB of KV and does not fit
 #                                       the 5.4 GiB pin; with it the server
 #                                       reports 72,785 tokens at 71,680 ctx
@@ -425,7 +429,13 @@ if (-not $NoPatches -and -not $DryRun) {
     # them -- the bare call here silently no-op'd (and tripped the warning).
     # Every step's rc is checked now, not just the last one's.
     $rcs = @()
-    Invoke-Logged $py -Arguments @("$PATCHES\port_wsl_patches.py", '--batch', '3'); $rcs += $script:LastRc
+    # Repair the installed package in place. Any nonzero return means the patch
+    # set is in an unknown state -- a half-applied tree answers in garbage -- so
+    # do not start a server on top of it.
+    Invoke-Logged $py -Arguments @("$PATCHES\port_wsl_patches.py", '--site', '--batch', 'all')
+    if ($script:LastRc -ne 0) {
+        Fail "the patch step did not leave the installed vllm consistent (rc $script:LastRc).`n       See '--- python patches ---' in the log, then run the step by hand:`n       (port_wsl_patches.py --site --batch all)"
+    }
     Invoke-Logged $py -Arguments @("$PATCHES\fix_winloop_import.py", $SITEVLLM, "$REPO\vllm"); $rcs += $script:LastRc
     Invoke-Logged $py -Arguments @("$PATCHES\fix_responses_toolcall_none_name.py", $SITEVLLM, "$REPO\vllm"); $rcs += $script:LastRc
     # Runtime behaviour is gated on VLLM_OFFLOAD_RELEASE_AFTER_FORWARD, so the
@@ -632,7 +642,7 @@ if ($tpLine) {
     Write-Host "WARNING: _tree_probe.py returned nothing -- which vllm gets loaded is unverified" -ForegroundColor Yellow
 }
 if (-not $NoInt8 -and -not $DryRun -and $null -ne $treeNeg -and -not $treeNeg) {
-    Fail "int8 activations are on, but the package that would be loaded has no negative-scale fix.`n       AutoRound exports ~50% negative group scales and int8 Marlin reads them unsigned -> garbage.`n       Either re-apply _dev\patches\port_wsl_patches.py --batch 1, or re-run with -NoInt8."
+    Fail "int8 activations are on, but the package that would be loaded has no negative-scale fix.`n       AutoRound exports ~50% negative group scales and int8 Marlin reads them unsigned -> garbage.`n       Boot again without -NoPatches (it runs port_wsl_patches.py --site --batch all), or re-run with -NoInt8."
 }
 if (-not $NoInt8 -and $null -ne $treeSelect -and -not $treeSelect) {
     Write-Host "WARNING: this package has no VLLM_MARLIN_INT8_INCLUDE_RE -- INT8_LAYERS=mlp is ignored,`n         every Linear runs W4A8 (decode -5.7%, init +143 s)." -ForegroundColor Yellow
