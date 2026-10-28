@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import ClassVar
@@ -48,6 +49,20 @@ from ..common.ple import PLEVocabParallelEmbedding
 from .ops.ple import ple_ngram_ids
 
 logger = init_logger(__name__)
+
+# VLLM_PLE_IDS_VERIFY=1 compares the host-computed ids against the GPU kernel
+# once every 200 steps; off by default because it adds a D2H on that step.
+_PLE_IDS_VERIFY = os.environ.get("VLLM_PLE_IDS_VERIFY", "0") == "1"
+# VLLM_PLE_IDS_DEBUG=1 counts which prefetch hook runs and what it costs.
+_PLE_IDS_DEBUG = os.environ.get("VLLM_PLE_IDS_DEBUG", "0") == "1"
+_PLE_DBG = {
+    "outer": 0,
+    "host": 0,
+    "gpu": 0,
+    "noprefetch": 0,
+    "sync_us": 0.0,
+    "cpu_us": 0.0,
+}
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
@@ -818,6 +833,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 output=output,
             )
         input_ids = input_ids.long()
+        # The hash buffers live on the GPU in a served model; the portable path
+        # needs int64 host copies. They are constants, so build them once.
+        if self.layer_multipliers.device != input_ids.device:
+            cached = getattr(self, "_ple_host_hash", None)
+            if cached is None:
+                cached = (
+                    self.layer_multipliers.detach().to("cpu", torch.int64),
+                    self.ngram_heads_vocab_sizes.detach().to("cpu", torch.int64),
+                    self.ngram_heads_offsets.detach().to("cpu", torch.int64),
+                )
+                self._ple_host_hash = cached
+            hash_multipliers, hash_sizes, hash_offsets = cached
+        else:
+            hash_multipliers = self.layer_multipliers
+            hash_sizes = self.ngram_heads_vocab_sizes
+            hash_offsets = self.ngram_heads_offsets
         query_start_loc = query_start_loc.long()
         positions = torch.arange(num_tokens, device=input_ids.device, dtype=torch.int64)
         packed = torch.full(
@@ -856,13 +887,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         for ngram in range(2, self.ngram_size + 1):
             start = (ngram - 2) * self.heads_per_ngram
             end = start + self.heads_per_ngram
-            mixed = shifted[0] * self.layer_multipliers[0]
+            mixed = shifted[0] * hash_multipliers[0]
             for index in range(1, ngram):
                 mixed = torch.bitwise_xor(
-                    mixed, shifted[index] * self.layer_multipliers[index]
+                    mixed, shifted[index] * hash_multipliers[index]
                 )
-            sizes = self.ngram_heads_vocab_sizes[start:end]
-            offsets = self.ngram_heads_offsets[start:end]
+            sizes = hash_sizes[start:end]
+            offsets = hash_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
         return torch.cat(id_blocks, dim=-1)
@@ -886,11 +917,69 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        host_ids: dict | None = None,
     ) -> None:
         """Start the pinned lookup while the preceding decoder layer runs."""
         embedding = self.ngram_embedding
         if not embedding.supports_prefetch:
+            if _PLE_IDS_DEBUG:
+                _PLE_DBG["noprefetch"] += 1
             return
+        if _PLE_IDS_DEBUG:
+            import time as _time
+
+            _PLE_DBG["outer"] += 1
+            if _PLE_DBG["outer"] % 100 == 0:
+                n = max(1, _PLE_DBG["outer"])
+                logger.info(
+                    "PLE ids debug: outer=%d host=%d gpu=%d noprefetch=%d "
+                    "sync=%.0fus/step cpu=%.0fus/step",
+                    _PLE_DBG["outer"],
+                    _PLE_DBG["host"],
+                    _PLE_DBG["gpu"],
+                    _PLE_DBG["noprefetch"],
+                    _PLE_DBG["sync_us"] / n,
+                    _PLE_DBG["cpu_us"] / n,
+                )
+            _t0 = _time.perf_counter()
+        if host_ids is not None:
+            # The staged copies were queued before the model's kernels, so this
+            # returns at once; the math is the bit-identical CPU branch.
+            host_ids["event"].synchronize()
+            if _PLE_IDS_DEBUG:
+                _t1 = _time.perf_counter()
+                _PLE_DBG["sync_us"] += (_t1 - _t0) * 1e6
+            ngram_ids = self.compute_ngram_ids(
+                host_ids["input_ids"][: host_ids["num_tokens"]],
+                host_ids["query_start_loc"][: host_ids["num_reqs"] + 1],
+                host_ids["ngram_context"][: host_ids["num_reqs"]],
+            )
+            if _PLE_IDS_DEBUG:
+                _PLE_DBG["host"] += 1
+                _PLE_DBG["cpu_us"] += (_time.perf_counter() - _t1) * 1e6
+            if _PLE_IDS_VERIFY:
+                step = getattr(self, "_verify_step", 0)
+                self._verify_step = step + 1
+                if step % 200 == 0:
+                    gpu_ids = self.compute_ngram_ids(
+                        input_ids, query_start_loc, ngram_context
+                    ).cpu()
+                    if torch.equal(gpu_ids, ngram_ids):
+                        logger.info("PLE host ids match the GPU kernel (step %d)", step)
+                    else:
+                        bad = (gpu_ids != ngram_ids).any(dim=1).nonzero().flatten()
+                        logger.error(
+                            "PLE host ids MISMATCH at step %d: %d/%d rows "
+                            "differ, first %s",
+                            step,
+                            bad.numel(),
+                            gpu_ids.shape[0],
+                            bad[:5].tolist(),
+                        )
+            embedding.start_prefetch(hidden_states, ngram_ids)
+            return
+        if _PLE_IDS_DEBUG:
+            _PLE_DBG["gpu"] += 1
         ngram_ids = self.compute_ngram_ids(
             input_ids,
             query_start_loc,

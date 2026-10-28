@@ -5,6 +5,7 @@
 import os
 from collections.abc import Iterable
 from itertools import islice
+from typing import Any
 
 import torch
 from torch import nn
@@ -565,6 +566,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
+        host_ids: dict[str, Any] | None = None,
     ) -> None:
         """Start a layer's PLE prefetch when the required inputs exist."""
         ple: Qwen4ExpPLELayer | None = getattr(layer, "ple", None)
@@ -577,6 +579,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
             input_ids,
             query_start_loc,
             ngram_context,
+            host_ids=host_ids,
         )
 
     def _aux_hidden_state(
@@ -613,6 +616,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
+        ple_host_ids: dict[str, Any] | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         pe = self.phase_events
         if pe is not None:
@@ -643,6 +647,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                 input_ids,
                 query_start_loc,
                 ngram_context,
+                ple_host_ids,
             )
         for layer_idx, layer in islice(
             enumerate(self.layers), self.start_layer, self.end_layer
@@ -655,6 +660,7 @@ class Qwen4ExpModel(nn.Module, EagleModelMixin):
                     input_ids,
                     query_start_loc,
                     ngram_context,
+                    ple_host_ids,
                 )
             if layer_idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(
@@ -1199,6 +1205,7 @@ class Qwen4ExpForConditionalGeneration(
             inputs_embeds=inputs_embeds,
             query_start_loc=kwargs.get("query_start_loc"),
             ngram_context=kwargs.get("ngram_context"),
+            ple_host_ids=kwargs.get("ple_host_ids"),
             deepstack_input_embeds=deepstack_input_embeds,
         )
         if inputs_embeds is not None and get_pp_group().is_first_rank:

@@ -157,6 +157,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        host_ids: dict | None = None,
     ) -> None:
         """Start the pinned PLE lookup while the preceding decoder layer runs."""
         self.ple_embedding.start_prefetch(
@@ -164,6 +165,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             input_ids,
             query_start_loc,
             ngram_context,
+            host_ids=host_ids,
         )
 
     @property

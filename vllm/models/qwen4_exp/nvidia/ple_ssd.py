@@ -624,6 +624,8 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         self._previous_use = torch.cuda.Event()
         self._previous_use.record()
         self._pending: Future | None = None
+        self._host_ids_pending = False
+        self.pending_host_ids = None
         self._coordinator = ThreadPoolExecutor(1, thread_name_prefix="ple-ssd-prefetch")
         self._stats = os.getenv("VLLM_PLE_SSD_STATS", "0") == "1"
         self._stat_wait = 0.0
@@ -690,7 +692,10 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         polls = 0
         slot = self._trace_slot
         pre_true = 1 if self._ids_ready.query() else 0
-        if self._ids_poll:
+        if self._host_ids_pending:
+            # Ids arrived from the host: no device-to-host copy to wait for.
+            self._host_ids_pending = False
+        elif self._ids_poll:
             while not self._ids_ready.query():
                 polls += 1
                 time.sleep(0.0002)
@@ -735,12 +740,44 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         if len(self._loaded_starts) != len(self._table._parts):
             raise RuntimeError("PLE checkpoint shards have not all been loaded")
         tokens = ngram_ids.shape[0]
+        if os.getenv("VLLM_PLE_IDS_DEBUG", "0") == "1":
+            self._dbg_calls = getattr(self, "_dbg_calls", 0) + 1
+            if self._dbg_calls % 100 == 0:
+                logger.info(
+                    "PLE SSD prefetch hook: %d calls, host=%d, avg host cost %.0fus, "
+                    "last ids on %s",
+                    self._dbg_calls,
+                    getattr(self, "_dbg_host", 0),
+                    getattr(self, "_dbg_host_us", 0.0)
+                    / max(1, getattr(self, "_dbg_host", 0)),
+                    ngram_ids.device.type,
+                )
         if tokens > self._ids.shape[0]:
             raise ValueError("PLE SSD prefetch exceeds configured token capacity")
         if BreakableCUDAGraphCapture.current() is not None:
             # Captured ID-producing kernels have not executed yet. Actual
             # lookups start on replay, when those kernels have run.
             return
+        provider = self.pending_host_ids
+        if provider is not None:
+            # The graph replays only this hook, so the per-step host ids are
+            # handed over here instead of through the model's forward kwargs.
+            self.pending_host_ids = None
+            t0 = time.perf_counter()
+            try:
+                host_ids = provider()
+            except Exception:
+                logger.exception("PLE host ids provider failed; using CUDA ids")
+                host_ids = None
+            if host_ids is not None:
+                ngram_ids = host_ids
+                tokens = ngram_ids.shape[0]
+                if os.getenv("VLLM_PLE_IDS_DEBUG", "0") == "1":
+                    self._dbg_host = getattr(self, "_dbg_host", 0) + 1
+                    self._dbg_host_us = (
+                        getattr(self, "_dbg_host_us", 0.0)
+                        + (time.perf_counter() - t0) * 1e6
+                    )
         # Host staging must outlive H2D; device staging must outlive its consumer.
         slot: _TraceSlot | None = None
         if self._trace:
@@ -755,6 +792,13 @@ class Qwen4ExpPLESSDEmbedding(Qwen4ExpPLEEmbedding):
         if slot is not None:
             slot.h_gate_end = time.perf_counter()
         self._stream.wait_event(self._previous_use)
+        if ngram_ids.device.type == "cpu":
+            # Ids already on the host: no preserve copy and no device-to-host
+            # copy, so the row read starts without waiting for the step's stream.
+            self._ids[:tokens].copy_(ngram_ids)
+            self._host_ids_pending = True
+            self._pending = self._coordinator.submit(self._read_and_copy, tokens)
+            return
         # Preserve IDs before the next graph segment reuses their pool slot.
         self._device_ids[:tokens].copy_(ngram_ids)
         if slot is not None:

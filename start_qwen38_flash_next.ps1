@@ -74,6 +74,9 @@ param(
     [string]$Spec = 'dflash',
     [string]$Drafter = 'D:\models\Qwen3.8-Flash-Next-DFlash2',
     [int]$DflashDrafts = 7,
+    # Draft count by concurrency, e.g. '[[1,2,7],[3,4,5],[5,48,3]]' (upstream
+    # num_speculative_tokens_per_batch_size). Empty (default) = fixed -DflashDrafts.
+    [string]$SpecSchedule = '',
     # Acceptance-adaptive draft count. Default -1 means "follow -MtpTokens",
     # i.e. the feature is on. Pass 0 to turn it off, which keeps speculative
     # decoding byte-identical to a fixed draft count. Value is the maximum
@@ -86,6 +89,11 @@ param(
     [int]$MaxImages = 0,
     [switch]$NoAllocHeal,
     [switch]$NoMtp,
+    # Host-side PLE ids (see _dev\bin\_flashnext_struct_serve.ps1). Default off;
+    # measured +11% on single-user prose and neutral on code.
+    # Host-side PLE ids are ON by default since 2026-10-29; -NoPleHostIds
+    # restores the GPU ids path for a control instance.
+    [switch]$NoPleHostIds,
     [switch]$NoGraphs,
     [switch]$SkipGuard,
     # Kill whatever holds the engine handshake port (29550) or -Port instead of
@@ -167,6 +175,7 @@ if ($KvOffloadGb -gt 0) {
 }
 if (-not $NoGraphs) { $args += '-Graphs' }
 if ($NoAllocHeal) { $args += '-NoAllocHeal' }
+if ($NoPleHostIds) { $args += '-NoPleHostIds' }
 if ($DryRun) { $args += '-DryRun' }
 # Vision is ON by default; -NoVision falls back to the inner script's text-only
 # default (that is what the measurement arms use).
@@ -178,6 +187,7 @@ if ($AdaptiveK -ne -1) { $args += @('-AdaptiveK', "$AdaptiveK") }
 # The method is explicit whenever it is not the production default, so -NoMtp
 # still means "no speculation" and -Spec dflash overrides the MTP flags above.
 if ($Spec -ne 'auto') { $args += @('-Spec', $Spec) }
+if ($SpecSchedule) { $args += @('-SpecSchedule', $SpecSchedule) }
 if ($Spec -eq 'dflash') {
     $args += @('-Drafter', $Drafter, '-DflashDrafts', "$DflashDrafts")
 }
@@ -211,3 +221,5 @@ if ($Force) { $args += '-Force' }
     -SkipGuard:$SkipGuard `
     -ServerArgs $args
 exit $LASTEXITCODE
+
+

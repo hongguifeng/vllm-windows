@@ -83,6 +83,39 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        # VLLM_PLE_HOST_IDS=1: compute the n-gram ids on the host. The GPU ids are
+        # produced inside the step and copied back at the PLE break, so that copy
+        # waits for the step's stream; the inputs to the same math are ready at
+        # the start of the step. Stage them early, then do the (bit-identical)
+        # CPU math at the break, and the SSD row read no longer waits.
+        self.host_ple_ids = os.environ.get("VLLM_PLE_HOST_IDS", "0") == "1"
+        if self.host_ple_ids:
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self._ids_stream = torch.cuda.Stream(device=device)
+            self._ids_ready = torch.cuda.Event()
+            self._host_ids_tokens = torch.empty(
+                max_tokens, dtype=torch.int32, pin_memory=True
+            )
+            self._host_ids_qsl = torch.empty(
+                self.max_num_reqs + 1, dtype=torch.int32, pin_memory=True
+            )
+            self._host_ids_ctx = torch.empty(
+                (self.max_num_reqs, self.ngram_context_len),
+                dtype=torch.int32,
+                pin_memory=True,
+            )
+            # The inner PLE prefetch hook is the only Python that runs on every
+            # graph replay, so per-step host ids reach it through a slot on the
+            # embedding, not through forward kwargs (those are read at capture).
+            from .ngram_embedding import Qwen4ExpNGramEmbedding
+            from .ple_ssd import Qwen4ExpPLESSDEmbedding
+
+            self.ple_host_modules = [
+                m
+                for m in model.modules()
+                if isinstance(m, Qwen4ExpNGramEmbedding)
+                and isinstance(m.ngram_embedding, Qwen4ExpPLESSDEmbedding)
+            ]
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -141,11 +174,56 @@ class Qwen4ExpModelState(MambaHybridModelState):
         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
         # Represent unused capacity as trailing zero-length requests.
         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
+        if self.host_ple_ids and input_batch.num_tokens > 0:
+            # Ordered after this step's input preparation, but queued before the
+            # model's kernels, so by the PLE break the copies are long done.
+            num_tokens = input_batch.num_tokens
+            n_reqs = num_reqs_padded + 1
+            with torch.cuda.stream(self._ids_stream):
+                self._ids_stream.wait_stream(torch.cuda.current_stream())
+                self._host_ids_tokens[:num_tokens].copy_(
+                    input_batch.input_ids[:num_tokens], non_blocking=True
+                )
+                self._host_ids_qsl[:n_reqs].copy_(
+                    query_start_loc[:n_reqs], non_blocking=True
+                )
+                self._host_ids_ctx[:num_reqs_padded].copy_(
+                    ngram_context[:num_reqs_padded], non_blocking=True
+                )
+                self._ids_ready.record(self._ids_stream)
+            handle = {
+                "event": self._ids_ready,
+                "num_tokens": num_tokens,
+                "num_reqs": num_reqs_padded,
+                "input_ids": self._host_ids_tokens,
+                "query_start_loc": self._host_ids_qsl,
+                "ngram_context": self._host_ids_ctx,
+            }
+            for module in self.ple_host_modules:
+                module.ngram_embedding.pending_host_ids = self._host_ids_provider(
+                    module, handle
+                )
+            model_inputs["ple_host_ids"] = handle
         return model_inputs
+
+    @staticmethod
+    def _host_ids_provider(module, handle):
+        """Return a closure that computes this step's ids from staged copies."""
+
+        def provider():
+            handle["event"].synchronize()
+            return module.compute_ngram_ids(
+                handle["input_ids"][: handle["num_tokens"]],
+                handle["query_start_loc"][: handle["num_reqs"] + 1],
+                handle["ngram_context"][: handle["num_reqs"]],
+            )
+
+        return provider
 
     def prepare_dummy_inputs(
         self,

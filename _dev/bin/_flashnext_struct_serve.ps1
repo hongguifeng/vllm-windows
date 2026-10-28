@@ -79,6 +79,16 @@ param(
     [string]$KvOffloadDir = '',
     [switch]$FullWeights,
     [switch]$PleSsd,
+    # Compute the PLE n-gram ids on the host (VLLM_PLE_HOST_IDS=1). Measured on one
+    # 170HX: +11% for single-user prose (low draft acceptance), neutral for code,
+    # noisy at 4 users; each step then waits 11-14 ms on the staged copies, hidden
+    # behind the GPU lead. Off by default so the default path stays unchanged.
+    # Default ON since 2026-10-29: ids are computed on the host and handed to the
+    # per-step prefetch hook. Measured +5~11% for single-user prose, neutral for
+    # code, quality-level on the differential suite. -NoPleHostIds keeps the
+    # previous (GPU ids) path, e.g. for a control instance.
+    [switch]$NoPleHostIds,
+    [switch]$PleHostIds,
     [int]$PleDepth = 256,
     [int]$PleCacheMb = 128,
     [int]$PleWorkers = 8,
@@ -141,6 +151,10 @@ param(
     [string]$Spec = 'auto',
     [string]$Drafter = 'D:\models\Qwen3.8-Flash-Next-DFlash2',
     [int]$DflashDrafts = 7,
+    # Upstream dynamic speculative decoding: a bracketed list [[first,last,drafts],...]
+    # passed through as num_speculative_tokens_per_batch_size. Empty (default) keeps a
+    # fixed draft count, i.e. production behaviour unchanged.
+    [string]$SpecSchedule = '',
     # -AdaptiveK turns on the acceptance-adaptive draft count: the scheduler
     # picks this step's verification width from the running requests' recent
     # acceptance instead of always using -MtpTokens. Value is the maximum count
@@ -213,6 +227,7 @@ if ($FullWeights) {
     }
 }
 
+if ($NoPleHostIds) { $env:VLLM_PLE_HOST_IDS = '0' } else { $env:VLLM_PLE_HOST_IDS = '1' }
 if ($PleSsd) {
     $env:VLLM_ALLOW_EXTERNAL_PLE_SSD_LIBRARY = '1'
 }
@@ -450,6 +465,7 @@ if ($specMethod -eq 'dflash' -and -not (Test-Path -LiteralPath "$Drafter\config.
 }
 if ($specMethod -eq 'mtp') {
     if ($AdaptiveK -lt 0) { $AdaptiveK = $MtpTokens }
+    if ($SpecSchedule -and $AdaptiveK -gt 0) { throw '-SpecSchedule replaces adaptive_k upstream; pass -AdaptiveK 0 for a fixed draft count, or drop -SpecSchedule' }
     $specJson = '{"method": "mtp", "num_speculative_tokens": ' + $MtpTokens + '}'
     if ($AdaptiveK -gt 0) {
         if ($AdaptiveK -gt $MtpTokens) {
@@ -467,12 +483,17 @@ if ($specMethod -eq 'mtp') {
     elseif ($KvOffloadGb -gt 0) {
         $specJson = $specJson.TrimEnd('}') + ', "disable_eagle_block_drop": true}'
     }
+    if ($SpecSchedule) { $specJson = $specJson.TrimEnd('}') + ', "num_speculative_tokens_per_batch_size": ' + $SpecSchedule + '}' }
     $argv += @('--speculative-config', (EscJson $specJson))
 }
 elseif ($specMethod -eq 'dflash') {
     $drafterPath = $Drafter -replace '\\', '/'
     $specJson = '{"method": "dflash", "model": "' + $drafterPath +
         '", "num_speculative_tokens": ' + $DflashDrafts
+    if ($SpecSchedule) {
+        if (-not $SpecSchedule.StartsWith('[')) { throw "-SpecSchedule must be a bracketed list, got '$SpecSchedule'" }
+        $specJson += ', "num_speculative_tokens_per_batch_size": ' + $SpecSchedule
+    }
     if ($KvOffloadGb -gt 0) { $specJson += ', "disable_eagle_block_drop": true' }
     $specJson += '}'
     $argv += @('--speculative-config', (EscJson $specJson))
@@ -574,6 +595,7 @@ Write-Host ("log    : $log")
 Write-Host ''
 
 if ($DryRun) {
+    Write-Host "env VLLM_PLE_HOST_IDS=$env:VLLM_PLE_HOST_IDS"
     Write-Host ($py + ' ' + ($argv -join ' '))
     exit 0
 }
@@ -617,3 +639,7 @@ Write-Host ''
 Write-Host "exited with $code" -ForegroundColor Yellow
 Write-Host "log: $log" -ForegroundColor DarkGray
 exit $code
+
+
+
+
