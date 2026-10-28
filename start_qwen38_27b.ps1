@@ -18,7 +18,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = 'D:\code\vllm-windows'
-$launcher = "$repo\start_server_170hx.ps1"
+$launcher = "$repo\start_qwen38_27b_170hx.ps1"
 
 if (-not (Test-Path -LiteralPath "$Model\config.json")) {
     Write-Host "ERROR: model config not found: $Model\config.json" -ForegroundColor Red

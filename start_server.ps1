@@ -603,6 +603,39 @@ if ($KvDtype -ne 'bfloat16') {
 # below only prints VLLM_/PYTHON/TORCH_/... prefixed names, so a repro run that
 # never armed the probe looked exactly like a clean run (both show zero
 # `[idcheck]` lines).  Report the probe + blocking state in the header, and add
+# --------------------------------------------------- loaded-tree probe --
+# int8 activations are only correct on a package that carries both Marlin
+# patches, and those live in the *installed* package -- not in the checked-out
+# vllm\ tree, which also does not warn about unknown env vars. So the two ways
+# this breaks (an editable/fork install landing in the venv, or a fresh venv
+# whose batch-1 patches were never applied) are otherwise invisible: every
+# Linear silently runs W4A8 and the output garbles. Ask the interpreter which
+# package it resolves once the repo's own directories are off sys.path -- the
+# same view the child gets, since it is launched from outside the repo.
+$treeVer = $treeFile = ''
+$treeSelect = $treeNeg = $null
+$tpLine = & $py "$DEV\bin\_tree_probe.py" 2>$null |
+    Where-Object { $_ -like 'TREE|*' } | Select-Object -First 1
+if ($tpLine) {
+    $tf = $tpLine -split '\|'
+    $treeVer    = $tf[1]
+    $treeFile   = $tf[2]
+    $treeSelect = ($tf[3] -eq '1')
+    $treeNeg    = ($tf[4] -eq '1')
+} else {
+    Write-Host "WARNING: _tree_probe.py returned nothing -- which vllm gets loaded is unverified" -ForegroundColor Yellow
+}
+if (-not $NoInt8 -and -not $DryRun -and $null -ne $treeNeg -and -not $treeNeg) {
+    Fail "int8 activations are on, but the package that would be loaded has no negative-scale fix.`n       AutoRound exports ~50% negative group scales and int8 Marlin reads them unsigned -> garbage.`n       Either re-apply _dev\patches\port_wsl_patches.py --batch 1, or re-run with -NoInt8."
+}
+if (-not $NoInt8 -and $null -ne $treeSelect -and -not $treeSelect) {
+    Write-Host "WARNING: this package has no VLLM_MARLIN_INT8_INCLUDE_RE -- INT8_LAYERS=mlp is ignored,`n         every Linear runs W4A8 (decode -5.7%, init +143 s)." -ForegroundColor Yellow
+}
+
+# 2026-09-21: DFLASH2_IDCHECK was invisible to post-mortems -- the env dump
+# below only prints VLLM_/PYTHON/TORCH_/... prefixed names, so a repro run that
+# never armed the probe looked exactly like a clean run (both show zero
+# `[idcheck]` lines).  Report the probe + blocking state in the header, and add
 # both to the env whitelist.
 $idkState = if ($env:DFLASH2_IDCHECK -eq '1') {
     "on (every $(if ($env:DFLASH2_IDCHECK_EVERY) { $env:DFLASH2_IDCHECK_EVERY } else { 25 }) steps)"
@@ -614,6 +647,9 @@ $info = @(
     "  context    $MaxLen tokens, KV pin $KvGiB GiB"
     "  vision     $(if ($TextOnly) { 'off (--language-model-only)' } else { "on$(if (-not $NoVisionOffload) { ', tower offloaded to RAM' })" })"
     "  int8 act   $(if ($NoInt8) { 'off' } else { 'on (mlp)' })   fused GDN $(if ($FusedGdn) { 'on' } else { 'off (float16 cache)' })"
+    "  tree       $treeVer"
+    "             $treeFile"
+    "             layer-select $(if ($null -eq $treeSelect) { 'unknown' } elseif ($treeSelect) { 'yes' } else { 'NO -- INT8_LAYERS ignored' })   negative-scale fix $(if ($null -eq $treeNeg) { 'unknown' } elseif ($treeNeg) { 'yes' } else { 'NO -- int8 output would garble' })"
     "  graphs     max_cudagraph_capture_size $MaxGraphCapture$(if ($MaxGraphCapture -lt 64) { "  (upstream default here is 64, but -MaxSeqs $MaxSeqs caps decode batches at $MaxSeqs)" })"
     "  vision copy $(if ($TextOnly) { 'n/a (text only)' } elseif ($NoVisionOffload) { 'tower stays on the card (~0.9 GiB resident)' } elseif ($ReleaseOffloadCopy) { 'released after each encode (default; -ReleaseOffloadCopy:$false to keep it)' } else { 'stays in the allocator -- 0.9 GiB gone for the life of the process' })"
     "  async      $(if ($Async) { 'on (--async-scheduling, default)' } else { 'off (--no-async-scheduling, -NoAsync)' })"
